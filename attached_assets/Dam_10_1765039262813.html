@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Hydropower Dam — Fixed v3 (lazy GLTF loader)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{
+      --bg:#f8fafc; --card:#fff; --primary:#2563eb; --muted:#475569; --border:#e2e8f0; --text:#0f172a;
+    }
+    html,body{ height:100%; margin:0; font-family:system-ui,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--text); }
+    header{ background:var(--card); padding:10px 18px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; }
+    .container{ display:grid; grid-template-columns:340px 1fr; gap:18px; padding:18px; max-width:1400px; margin:0 auto; box-sizing:border-box; }
+    .panel{ background:var(--card); padding:14px; border-radius:8px; border:1px solid var(--border); box-shadow:0 2px 8px rgba(2,6,23,0.03); box-sizing:border-box; }
+    label{ display:block; font-size:0.9rem; margin-top:10px; color:var(--muted) }
+    input[type=number], input[type=file], select, textarea { width:100%; padding:8px; margin-top:6px; border:1px solid var(--border); border-radius:6px; box-sizing:border-box; font-size:0.95rem; }
+    .btn{ padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-size:0.95rem }
+    .btn.primary{ background:var(--primary); color:white; }
+    .btn.ghost{ background:transparent; border:1px solid var(--border) }
+    .controls-row{ display:flex; gap:8px; margin-top:12px }
+    .results-grid{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:12px; margin-bottom:12px; }
+    .card{ padding:12px; background:var(--card); border:1px solid var(--border); border-radius:8px }
+    #viewer{ width:100%; height:620px; background:#e6eefc; border-radius:8px; overflow:hidden; position:relative; }
+    .small{ font-size:0.85rem; color:var(--muted) }
+    footer{ text-align:center; padding:18px; color:var(--muted) }
+    .top-actions{ display:flex; gap:8px; align-items:center; }
+    #errorTray{ position:fixed; left:12px; right:12px; bottom:12px; background:rgba(20,20,20,0.9); color:#fff; padding:8px 12px; border-radius:6px; font-family:monospace; font-size:12px; max-height:180px; overflow:auto; display:none; z-index:9999; }
+    #loaderNotice{ background:#fff8e6; border:1px solid #ffe3a6; padding:8px; border-radius:6px; margin-top:8px; color:#6a4b00; font-size:0.9rem; display:none; }
+    @media (max-width:1000px){ .container{ grid-template-columns: 1fr } #viewer{ height:420px } }
+  </style>
+</head>
+<body>
+  <header>
+    <div><strong>HydroSim — Dam 3D (Fixed v3)</strong></div>
+    <div class="small">Extruded dam always visible; GLB features lazy-loaded when available</div>
+  </header>
+
+  <main class="container">
+    <aside class="panel">
+      <h3>Dam Geometry (m)</h3>
+      <label>Top Width (a)</label>
+      <input id="topW" type="number" value="10" step="0.1" min="0.01">
+      <label>Bottom Width (b)</label>
+      <input id="botW" type="number" value="50" step="0.1" min="0.01">
+      <label>Height (h)</label>
+      <input id="height" type="number" value="20" step="0.1" min="0.01">
+      <label>Dam Length (L) — extrusion length</label>
+      <input id="faceL" type="number" value="200" step="1" min="0.01">
+
+      <h3 style="margin-top:14px">Reservoir & Flow</h3>
+      <label>Reservoir Length (m)</label>
+      <input id="resLen" type="number" value="1000" step="10">
+      <label>Water Depth (m)</label>
+      <input id="waterDepth" type="number" value="20" step="0.1">
+      <label>Flow Q (m³/s)</label>
+      <input id="flow" type="number" value="20" step="1">
+      <label>Efficiency η (0-1)</label>
+      <input id="eff" type="number" value="0.85" step="0.01" min="0.01" max="1">
+
+      <div class="controls-row" style="margin-top:12px;">
+        <button id="updateBtn" class="btn primary">Update 3D & Recompute</button>
+        <button id="resetView" class="btn ghost">Reset View</button>
+      </div>
+
+      <div id="loaderNotice"></div>
+
+      <hr style="margin:12px 0;border:none;border-top:1px solid var(--border)">
+      <h3>3D Model Loading</h3>
+      <label><input id="useGlb" type="checkbox"> Use uploaded GLB file (filename: <code>Dam.glb</code>)</label>
+      <div class="small" style="margin-top:6px">Or upload your own .glb/.gltf</div>
+      <input id="modelFile" type="file" accept=".glb,.gltf">
+      <div class="controls-row">
+        <button id="loadFile" class="btn">Load From File</button>
+        <button id="fitBtn" class="btn">Fit GLB to dims</button>
+      </div>
+
+      <hr style="margin:12px 0;border:none;border-top:1px solid var(--border)">
+      <h3>Export & Reports</h3>
+      <div class="controls-row" style="margin-top:8px;">
+        <button id="exportGLB" class="btn">Export .glb</button>
+        <button id="downloadCSV" class="btn">Download CSV</button>
+      </div>
+      <div style="margin-top:8px;">
+        <button id="downloadPDF" class="btn primary">Download PDF Report</button>
+      </div>
+
+      <div style="margin-top:8px" class="small">Tip: Use "Export .glb" to download the currently-generated extruded dam geometry.</div>
+    </aside>
+
+    <section>
+      <div class="panel" style="margin-bottom:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <h3 style="margin:0">Results</h3>
+          <div class="small">Cross-section, volume & power update instantly</div>
+        </div>
+        <div id="results" class="results-grid" style="margin-top:12px"></div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px">
+          <h3 style="margin:0">3D Viewer</h3>
+          <div class="top-actions">
+            <label class="small"><input id="showLabels" type="checkbox" checked> Show labels</label>
+            <label class="small"><input id="wireframe" type="checkbox"> Wireframe</label>
+          </div>
+        </div>
+        <div id="viewer" aria-label="3D viewer"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>Local client-side only — No server processing</footer>
+  <pre id="errorTray"></pre>
+
+  <!-- Three (CDN non-module) -->
+  <script src="https://unpkg.com/three@0.154.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/three@0.154.0/examples/js/exporters/GLTFExporter.js"></script>
+  <!-- NOTE: GLTFLoader is not created here to avoid immediate constructor errors in some file:// environments.
+       We will initialize it lazily when user attempts GLB actions. -->
+
+  <script>
+  // error tray helper
+  (function(){
+    const tray = document.getElementById('errorTray');
+    function show(e){
+      tray.style.display = 'block';
+      tray.textContent += (typeof e === 'string' ? e : (e && e.message ? e.message : JSON.stringify(e))) + '\n\n';
+      console.error(e);
+    }
+    window.showError = show;
+    window.addEventListener('error', (ev)=> show(ev.error || ev.message));
+    window.addEventListener('unhandledrejection', (ev)=> show(ev.reason || ev));
+  })();
+  </script>
+
+  <script>
+  (function(){
+    try {
+      // UI refs
+      const topWEl = document.getElementById('topW');
+      const botWEl = document.getElementById('botW');
+      const heightEl = document.getElementById('height');
+      const faceLEl = document.getElementById('faceL');
+      const resLenEl = document.getElementById('resLen');
+      const waterDepthEl = document.getElementById('waterDepth');
+      const flowEl = document.getElementById('flow');
+      const effEl = document.getElementById('eff');
+
+      const updateBtn = document.getElementById('updateBtn');
+      const resetViewBtn = document.getElementById('resetView');
+      const resultsDiv = document.getElementById('results');
+
+      const useGlbEl = document.getElementById('useGlb');
+      const modelFileInput = document.getElementById('modelFile');
+      const loadFileBtn = document.getElementById('loadFile');
+      const fitBtn = document.getElementById('fitBtn');
+
+      const exportGLBBtn = document.getElementById('exportGLB');
+      const downloadCSVBtn = document.getElementById('downloadCSV');
+      const downloadPDFBtn = document.getElementById('downloadPDF');
+
+      const showLabelsEl = document.getElementById('showLabels');
+      const wireframeEl = document.getElementById('wireframe');
+
+      const loaderNotice = document.getElementById('loaderNotice');
+
+      // Three.js scene
+      const container = document.getElementById('viewer');
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xf3f7ff);
+
+      const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 5000);
+      camera.position.set(260, 160, 420);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      container.appendChild(renderer.domElement);
+
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x444455, 0.75);
+      scene.add(hemi);
+      const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+      dir.position.set(120, 250, 120);
+      scene.add(dir);
+
+      const grid = new THREE.GridHelper(1200, 60, 0x9aa7b2, 0xe6eefc);
+      scene.add(grid);
+
+      const damMaterial = new THREE.MeshStandardMaterial({ color: 0x8899c8, metalness: 0.12, roughness: 0.55 });
+
+      // lazy loader & exporter references (create only when needed)
+      let gltfLoader = null;
+      let exporter = null; // GLTFExporter loaded above but may attach differently depending on CDN; we'll lazy-create wrapper
+
+      // mesh & groups
+      let extrudeMesh = null;
+      let glbWrapper = null;
+      let glbScene = null;
+      const labelGroup = new THREE.Group(); scene.add(labelGroup);
+      const annotationGroup = new THREE.Group(); scene.add(annotationGroup);
+
+      // SimpleControls (same as before) - local orbit/zoom/pan
+      class SimpleControls {
+        constructor(camera, dom) {
+          this.camera = camera;
+          this.dom = dom;
+          this.target = new THREE.Vector3(0, 12, 0);
+          const pos = camera.position.clone().sub(this.target);
+          this.spherical = new THREE.Spherical();
+          this.spherical.setFromVector3(pos);
+          this.minRadius = 10;
+          this.maxRadius = 5000;
+          this.state = { rotating: false, panning: false, lastX: 0, lastY: 0 };
+          this.rotateSpeed = 0.005;
+          this.panSpeed = 0.5;
+          this.zoomSpeed = 1.0;
+          this._bindEvents();
+        }
+        _bindEvents(){
+          this.dom.style.touchAction = 'none';
+          this.dom.addEventListener('pointerdown', this._onDown.bind(this), {passive:false});
+          window.addEventListener('pointermove', this._onMove.bind(this), {passive:false});
+          window.addEventListener('pointerup', this._onUp.bind(this), {passive:false});
+          this.dom.addEventListener('wheel', this._onWheel.bind(this), {passive:false});
+          this.dom.addEventListener('dblclick', (e)=>{ this.reset(); }, false);
+        }
+        _onDown(e){
+          this.dom.setPointerCapture && this.dom.setPointerCapture(e.pointerId);
+          const isShift = e.shiftKey;
+          if (isShift || e.button === 2) { this.state.panning = true; }
+          else { this.state.rotating = true; }
+          this.state.lastX = e.clientX; this.state.lastY = e.clientY;
+        }
+        _onMove(e){
+          if (!this.state.rotating && !this.state.panning) return;
+          e.preventDefault();
+          const dx = e.clientX - this.state.lastX;
+          const dy = e.clientY - this.state.lastY;
+          this.state.lastX = e.clientX; this.state.lastY = e.clientY;
+          if (this.state.rotating) {
+            this.spherical.theta -= dx * this.rotateSpeed;
+            this.spherical.phi -= dy * this.rotateSpeed;
+            const EPS = 0.0001;
+            this.spherical.phi = Math.max(EPS, Math.min(Math.PI - EPS, this.spherical.phi));
+          } else if (this.state.panning) {
+            const offset = new THREE.Vector3();
+            const camera = this.camera;
+            const panLeft = function(distance, objectMatrix) {
+              const v = new THREE.Vector3();
+              v.setFromMatrixColumn(objectMatrix, 0);
+              v.multiplyScalar(-distance);
+              offset.add(v);
+            };
+            const panUp = function(distance, objectMatrix) {
+              const v = new THREE.Vector3();
+              v.setFromMatrixColumn(objectMatrix, 1);
+              v.multiplyScalar(distance);
+              offset.add(v);
+            };
+            const distance = this.spherical.radius;
+            panLeft( dx * 0.002 * distance * this.panSpeed, camera.matrix );
+            panUp( dy * 0.002 * distance * this.panSpeed, camera.matrix );
+            this.target.add(offset);
+          }
+          this._apply();
+        }
+        _onUp(e){
+          try { this.dom.releasePointerCapture && this.dom.releasePointerCapture(e.pointerId); } catch(e){}
+          this.state.rotating = false; this.state.panning = false;
+        }
+        _onWheel(e){
+          e.preventDefault();
+          const delta = (e.deltaY > 0) ? 1 : -1;
+          this.spherical.radius += delta * this.zoomSpeed * (this.spherical.radius*0.08);
+          this.spherical.radius = Math.max(this.minRadius, Math.min(this.maxRadius, this.spherical.radius));
+          this._apply();
+        }
+        _apply(){
+          const vec = new THREE.Vector3();
+          vec.setFromSpherical(this.spherical).add(this.target);
+          this.camera.position.copy(vec);
+          this.camera.lookAt(this.target);
+        }
+        update(){ }
+        reset(){
+          this.target.set(0,12,0);
+          this.spherical.set(400, Math.PI*0.25, Math.PI*0.8);
+          this._apply();
+        }
+      }
+
+      // geometry + annotation functions (same as earlier)
+      function buildExtrudedDam(a,b,h,L){
+        const halfA = a/2, halfB = b/2;
+        const shape = new THREE.Shape();
+        shape.moveTo(-halfB, 0);
+        shape.lineTo(halfB, 0);
+        shape.lineTo(halfA, h);
+        shape.lineTo(-halfA, h);
+        shape.lineTo(-halfB, 0);
+        const extrudeSettings = { depth: L, bevelEnabled: false, steps: 1 };
+        const geom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+        geom.computeBoundingBox();
+        geom.computeVertexNormals();
+        geom.translate(0, 0, -L/2);
+        const mesh = new THREE.Mesh(geom, damMaterial.clone());
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        return mesh;
+      }
+
+      function addDimensionLine(p1, p2, color=0x003366) {
+        const material = new THREE.LineBasicMaterial({ color });
+        const points = [ new THREE.Vector3(p1[0],p1[1],p1[2]), new THREE.Vector3(p2[0],p2[1],p2[2]) ];
+        const geo = new THREE.BufferGeometry().setFromPoints(points);
+        const line = new THREE.Line(geo, material);
+        annotationGroup.add(line);
+        const tickLen = Math.min( Math.max( Math.min(1, points[0].distanceTo(points[1]) * 0.03 ), 0.2 ), 2 );
+        const normal = new THREE.Vector3().subVectors(points[1], points[0]).normalize();
+        const up = new THREE.Vector3(0,1,0);
+        let side = new THREE.Vector3().crossVectors(normal, up).normalize();
+        if (side.length() < 0.001) side = new THREE.Vector3(1,0,0);
+        annotationGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([points[0], new THREE.Vector3().addVectors(points[0], side.clone().multiplyScalar(tickLen))]), material));
+        annotationGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([points[0], new THREE.Vector3().addVectors(points[0], side.clone().multiplyScalar(-tickLen))]), material));
+        annotationGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([points[1], new THREE.Vector3().addVectors(points[1], side.clone().multiplyScalar(tickLen))]), material));
+        annotationGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([points[1], new THREE.Vector3().addVectors(points[1], side.clone().multiplyScalar(-tickLen))]), material));
+        return line;
+      }
+
+      function roundRect(ctx, x, y, w, h, r, fill, stroke) {
+        if (typeof stroke === 'undefined') stroke = true;
+        if (typeof r === 'undefined') r = 5;
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + w, y, x + w, y + h, r);
+        ctx.arcTo(x + w, y + h, x, y + h, r);
+        ctx.arcTo(x, y + h, x, y, r);
+        ctx.arcTo(x, y, x + w, y, r);
+        ctx.closePath();
+        if (fill) ctx.fill();
+        if (stroke) ctx.stroke();
+      }
+
+      function makeLabelSprite(text) {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        const fontSize = 34;
+        ctx.font = `${fontSize}px sans-serif`;
+        const metrics = ctx.measureText(text);
+        const padding = 14;
+        const w = Math.ceil(metrics.width) + padding*2;
+        const h = fontSize + padding*2;
+        canvas.width = w; canvas.height = h;
+        ctx.fillStyle = 'rgba(255,255,255,0.95)';
+        roundRect(ctx, 0, 0, w, h, 8, true, false);
+        ctx.fillStyle = '#0b2546'; ctx.font = `${fontSize}px sans-serif`; ctx.textBaseline = 'middle';
+        ctx.fillText(text, padding, h/2);
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.minFilter = THREE.LinearFilter;
+        const mat = new THREE.SpriteMaterial({ map: texture, depthTest: false, depthWrite: false, sizeAttenuation: false });
+        const sprite = new THREE.Sprite(mat);
+        sprite.scale.set(w/40, h/40, 1);
+        return sprite;
+      }
+
+      function updateAnnotations(a,b,h,L) {
+        annotationGroup.clear(); labelGroup.clear();
+        if (!showLabelsEl.checked) return;
+        const zFront = L/2;
+        addDimensionLine([-b/2,0,zFront], [b/2,0,zFront]);
+        const lB = makeLabelSprite(`b = ${b.toFixed(2)} m`); lB.position.set(0, - (Math.max(0.5, h*0.02)), zFront + Math.min(6, L*0.02)); labelGroup.add(lB);
+        addDimensionLine([-a/2,h,zFront], [a/2,h,zFront]);
+        const lA = makeLabelSprite(`a = ${a.toFixed(2)} m`); lA.position.set(0, h + Math.min(6, h*0.12), zFront + Math.min(6, L*0.02)); labelGroup.add(lA);
+        const xSide = b/2 + Math.min(8, b*0.06);
+        addDimensionLine([xSide,0,0], [xSide,h,0]);
+        const lH = makeLabelSprite(`h = ${h.toFixed(2)} m`); lH.position.set(xSide + Math.min(6, b*0.03), h/2, 0); labelGroup.add(lH);
+        addDimensionLine([-b/2 - Math.min(8, b*0.06),0,-L/2], [-b/2 - Math.min(8, b*0.06),0,L/2]);
+        const lL = makeLabelSprite(`L = ${L.toFixed(2)} m`); lL.position.set(-b/2 - Math.min(10, b*0.07), -Math.min(4, h*0.03), 0); labelGroup.add(lL);
+      }
+
+      function computeGeometry(a,b,h,L){ const area = 0.5*(a+b)*h; const volume = area*L; return {area, volume}; }
+
+      function updateResultsUI(calc){
+        resultsDiv.innerHTML = '';
+        const mk = (title, val, sub) => {
+          const el = document.createElement('div'); el.className='card';
+          el.innerHTML = `<div style="font-weight:700">${title}</div><div style="font-size:1.1rem;margin-top:6px">${val}</div><div class="small" style="margin-top:8px">${sub||''}</div>`;
+          resultsDiv.appendChild(el);
+        };
+        mk('Cross-section area', `${calc.area.toLocaleString(undefined,{maximumFractionDigits:3})} m²`, 'A = 0.5 × (a + b) × h');
+        mk('Dam volume (extruded)', `${calc.volume.toLocaleString(undefined,{maximumFractionDigits:3})} m³`, 'V = A × L');
+        const rho = 1000, g = 9.81;
+        const powerW = calc.flow * calc.eff * rho * g * calc.waterDepth;
+        mk('Potential power', `${(powerW/1e6).toLocaleString(undefined,{maximumFractionDigits:6})} MW`, 'P = η × ρ × g × h × Q');
+        const runtimeHrs = calc.volume / (calc.flow || 1) / 3600;
+        mk('Reservoir runtime @ Q', `${runtimeHrs.toLocaleString(undefined,{maximumFractionDigits:3})} hours`, 'Runtime = V / Q');
+      }
+
+      function setExtrudedMesh(a,b,h,L){
+        const newMesh = buildExtrudedDam(a,b,h,L);
+        newMesh.position.y = 0;
+        newMesh.visible = true;
+        newMesh.material.wireframe = wireframeEl.checked;
+        if (extrudeMesh) {
+          extrudeMesh.geometry && extrudeMesh.geometry.dispose();
+          extrudeMesh.material && extrudeMesh.material.dispose();
+          scene.remove(extrudeMesh);
+        }
+        extrudeMesh = newMesh;
+        scene.add(extrudeMesh);
+      }
+
+      function frameScene(){
+        const box = new THREE.Box3();
+        if (useGlbEl.checked && glbWrapper) box.setFromObject(glbWrapper);
+        else if (extrudeMesh) box.setFromObject(extrudeMesh);
+        else box.set(new THREE.Vector3(-10,-10,-10), new THREE.Vector3(10,10,10));
+        const size = new THREE.Vector3(); box.getSize(size);
+        const center = new THREE.Vector3(); box.getCenter(center);
+        controls.target.copy(center);
+        const maxDim = Math.max(size.x, size.y, size.z, 10);
+        const camDist = maxDim * 1.6 + 80;
+        camera.position.set(center.x + camDist*0.55, center.y + camDist*0.6, center.z + camDist*0.9);
+        camera.lookAt(center);
+      }
+
+      // Lazy initialize GLTFLoader if available
+      function ensureGLTFLoader() {
+        if (gltfLoader) return true;
+        // try to find a global loader (examples/js attaches THREE.GLTFLoader)
+        if (window.THREE && window.THREE.GLTFLoader) {
+          try { gltfLoader = new THREE.GLTFLoader(); return true; } catch(e){ console.warn('GLTFLoader exists but failed to construct', e); }
+        }
+        // try loading the non-module loader script dynamically (best-effort)
+        return false;
+      }
+
+      // Lazy initialize exporter
+      function ensureExporter() {
+        if (exporter) return true;
+        if (window.THREE && window.THREE.GLTFExporter) {
+          try { exporter = new THREE.GLTFExporter(); return true; } catch(e){ console.warn('GLTFExporter exists but failed to construct', e); }
+        }
+        // If exporter isn't present, the CDN script was added earlier, but the ctor may be at window.THREE.GLTFExporter.
+        // We'll show a notice in UI if not available.
+        return false;
+      }
+
+      function loadGLBFromURL(url) {
+        return new Promise((resolve, reject) => {
+          if (!ensureGLTFLoader()) {
+            loaderNotice.style.display = 'block';
+            loaderNotice.innerText = 'GLTF loader not available in this environment. To enable GLB loading, open the file via a local server (e.g. `python -m http.server`) or use the Load From File button. (File:// often blocks example scripts.)';
+            return reject(new Error('GLTFLoader unavailable'));
+          }
+          gltfLoader.load(url, (gltf) => {
+            if (glbWrapper) { safeRemove(glbWrapper); glbWrapper = null; glbScene = null; }
+            glbScene = gltf.scene || gltf.scenes[0];
+            glbWrapper = new THREE.Group(); glbWrapper.add(glbScene); scene.add(glbWrapper);
+            loaderNotice.style.display = 'none';
+            resolve(gltf);
+          }, undefined, (err) => {
+            console.warn('GLB load failed', err);
+            loaderNotice.style.display = 'block';
+            loaderNotice.innerText = 'Failed to auto-load Dam.glb. Upload one using the "Load From File" button.';
+            reject(err);
+          });
+        });
+      }
+
+      function loadGLBFromFile(file) {
+        return new Promise((resolve, reject)=>{
+          if (!ensureGLTFLoader()) {
+            loaderNotice.style.display = 'block';
+            loaderNotice.innerText = 'GLTF loader not available for file upload in this environment. Open via local server to enable loader.';
+            return reject(new Error('GLTFLoader unavailable'));
+          }
+          const url = URL.createObjectURL(file);
+          gltfLoader.load(url, (gltf) => {
+            if (glbWrapper) { safeRemove(glbWrapper); glbWrapper = null; glbScene = null; }
+            glbScene = gltf.scene || gltf.scenes[0];
+            glbWrapper = new THREE.Group(); glbWrapper.add(glbScene); scene.add(glbWrapper);
+            setTimeout(()=>URL.revokeObjectURL(url),2000);
+            loaderNotice.style.display = 'none';
+            resolve(gltf);
+          }, undefined, (err)=> {
+            loaderNotice.style.display = 'block';
+            loaderNotice.innerText = 'Failed to load uploaded GLB.';
+            reject(err);
+          });
+        });
+      }
+
+      function fitGLB(b,h,L){
+        if (!glbWrapper) return;
+        const box = new THREE.Box3().setFromObject(glbWrapper);
+        const size = new THREE.Vector3(); box.getSize(size);
+        if (size.x === 0 || size.y === 0 || size.z === 0) return;
+        const sx = b / size.x, sy = h / size.y, sz = L / size.z;
+        glbWrapper.scale.set(sx, sy, sz);
+        const newBox = new THREE.Box3().setFromObject(glbWrapper);
+        const center = new THREE.Vector3(); newBox.getCenter(center);
+        const baseY = newBox.min.y;
+        glbWrapper.position.x -= center.x;
+        glbWrapper.position.z -= center.z;
+        glbWrapper.position.y -= baseY;
+      }
+
+      function exportExtrudeToGLB() {
+        if (!ensureExporter()) {
+          loaderNotice.style.display = 'block';
+          loaderNotice.innerText = 'GLTF exporter not available in this environment. Open via a local server (or use a browser that allows example scripts) to enable exporter.';
+          return;
+        }
+        if (!extrudeMesh) { alert('No geometry to export'); return; }
+        exporter.parse(extrudeMesh, (result) => {
+          let output;
+          if (result instanceof ArrayBuffer) output = result;
+          else output = JSON.stringify(result, null, 2);
+          if (output instanceof ArrayBuffer) saveArrayBuffer(output, 'dam_extruded.glb');
+          else saveString(output, 'dam_extruded.json');
+        }, { binary: true });
+      }
+
+      function saveArrayBuffer(buffer, filename) {
+        const blob = new Blob([buffer], { type: 'application/octet-stream' });
+        const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = filename; document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(()=>URL.revokeObjectURL(link.href), 2000);
+      }
+      function saveString(text, filename) {
+        const blob = new Blob([text], { type: 'text/plain' });
+        const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = filename; document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(()=>URL.revokeObjectURL(link.href), 2000);
+      }
+
+      function safeRemove(obj) {
+        if (!obj) return;
+        obj.traverse && obj.traverse(child => {
+          if (child.isMesh) {
+            child.geometry && child.geometry.dispose();
+            if (child.material) {
+              try {
+                if (Array.isArray(child.material)) child.material.forEach(m=>m.dispose());
+                else child.material.dispose();
+              } catch(e){}
+            }
+          }
+        });
+        try { scene.remove(obj); } catch(e) {}
+      }
+
+      function downloadCSV(calc) {
+        const rows = [
+          ['Parameter','Value','Units','Note'],
+          ['Top width (a)', topWEl.value, 'm','Top width'],
+          ['Bottom width (b)', botWEl.value, 'm','Bottom width'],
+          ['Height (h)', heightEl.value, 'm','Dam height'],
+          ['Length (L)', faceLEl.value, 'm','Dam length (extrusion)'],
+          ['Cross-section area', calc.area.toFixed(6), 'm^2','A = 0.5*(a+b)*h'],
+          ['Volume', calc.volume.toFixed(6), 'm^3','V = A*L'],
+          ['Flow Q', flowEl.value, 'm^3/s','Flow'],
+          ['Efficiency η', effEl.value, '','Turbine efficiency'],
+          ['Water depth', waterDepthEl.value, 'm','Used for potential power calc'],
+        ];
+        const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
+        saveString(csv, 'dam_report.csv');
+      }
+
+      async function downloadPDF(calc) {
+        if (!window.jspdfLoaded) {
+          await new Promise((resolve) => {
+            const s = document.createElement('script');
+            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';
+            s.onload = () => { window.jspdfLoaded = true; resolve(); };
+            s.onerror = () => { alert('Failed to load PDF library'); resolve(); };
+            document.head.appendChild(s);
+          });
+        }
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ orientation: 'landscape' });
+        doc.setFontSize(18);
+        doc.text('Hydropower Dam Report', 14, 18);
+        doc.setFontSize(11);
+        const rows = [
+          ['Parameter', 'Value', 'Units', 'Note'],
+          ['Top width (a)', topWEl.value, 'm', 'Top width'],
+          ['Bottom width (b)', botWEl.value, 'm', 'Bottom width'],
+          ['Height (h)', heightEl.value, 'm', 'Dam height'],
+          ['Length (L)', faceLEl.value, 'm', 'Dam length (extrusion)'],
+          ['Cross-section area', calc.area.toFixed(6), 'm^2', 'A = 0.5*(a+b)*h'],
+          ['Volume', calc.volume.toFixed(6), 'm^3', 'V = A*L'],
+          ['Flow Q', flowEl.value, 'm^3/s', 'Flow'],
+          ['Efficiency η', effEl.value, '', 'Turbine efficiency'],
+          ['Water depth', waterDepthEl.value, 'm', 'Used for potential power calc'],
+        ];
+        let y = 30;
+        doc.setFontSize(10);
+        rows.forEach((r,i)=>{
+          const x = 14;
+          if (i === 0) doc.setFont(undefined, 'bold'); else doc.setFont(undefined, 'normal');
+          doc.text(String(r[0]), x, y);
+          doc.text(String(r[1]), x + 80, y);
+          doc.text(String(r[2]), x + 120, y);
+          doc.text(String(r[3]), x + 160, y);
+          y += 7;
+        });
+        const dataUrl = renderer.domElement.toDataURL('image/jpeg', 0.9);
+        doc.addImage(dataUrl, 'JPEG', 14, y + 6, 260, 140);
+        doc.save('dam_report.pdf');
+      }
+
+      // controls
+      const controls = new SimpleControls(camera, renderer.domElement);
+      controls.reset();
+
+      async function updateAll(){
+        const a = parseFloat(topWEl.value) || 0.001;
+        const b = parseFloat(botWEl.value) || 0.001;
+        const h = parseFloat(heightEl.value) || 0.001;
+        const L = parseFloat(faceLEl.value) || 0.001;
+        const flow = parseFloat(flowEl.value) || 0.001;
+        const eff = parseFloat(effEl.value) || 0.001;
+        const waterDepth = parseFloat(waterDepthEl.value) || 0.001;
+
+        setExtrudedMesh(a,b,h,L);
+
+        if (useGlbEl.checked) {
+          if (extrudeMesh) extrudeMesh.visible = false;
+          if (!glbWrapper) {
+            // attempt to create GLTFLoader if it exists (lazy)
+            if (!gltfLoader && window.THREE && window.THREE.GLTFLoader) {
+              try { gltfLoader = new THREE.GLTFLoader(); loaderNotice.style.display='none'; }
+              catch(e) { /* no loader */ }
+            }
+            // try to auto-load Dam.glb if loader available
+            if (gltfLoader) {
+              try { await loadGLBFromURL('Dam.glb'); } catch(e) {}
+            } else {
+              loaderNotice.style.display = 'block';
+              loaderNotice.innerText = 'GLTF loader not available: to enable GLB preview either run a local web server (recommended) or upload a GLB file with "Load From File".';
+            }
+          }
+          if (glbWrapper) { fitGLB(b,h,L); glbWrapper.visible = true; }
+        } else {
+          if (extrudeMesh) extrudeMesh.visible = true;
+          if (glbWrapper) glbWrapper.visible = false;
+        }
+
+        updateAnnotations(a,b,h,L);
+        if (extrudeMesh) extrudeMesh.material.wireframe = wireframeEl.checked;
+        const geometry = computeGeometry(a,b,h,L);
+        const calc = { ...geometry, flow, eff, waterDepth };
+        updateResultsUI(calc);
+        frameScene();
+        return calc;
+      }
+
+      // initial
+      updateAll();
+
+      // render loop
+      (function animate(){
+        requestAnimationFrame(animate);
+        labelGroup.children.forEach(sprite=>{
+          const dist = sprite.position.distanceTo(camera.position);
+          const scale = Math.max(1.0, dist * 0.009);
+          sprite.scale.setScalar(scale);
+        });
+        controls.update && controls.update();
+        renderer.render(scene, camera);
+      })();
+
+      // events & UI wiring
+      function debounce(fn, ms=220){ let t; return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args), ms); }; }
+      const auto = debounce(()=>updateAll(), 220);
+      [topWEl, botWEl, heightEl, faceLEl, resLenEl, waterDepthEl, flowEl, effEl, useGlbEl, wireframeEl, showLabelsEl].forEach(e=>{ e.addEventListener('input', auto); e.addEventListener('change', auto); });
+
+      loadFileBtn.addEventListener('click', async ()=>{
+        const f = modelFileInput.files[0];
+        if (!f) { alert('Choose a .glb/.gltf file first.'); return; }
+        // lazy-init loader if possible
+        if (!gltfLoader && window.THREE && window.THREE.GLTFLoader) {
+          try { gltfLoader = new THREE.GLTFLoader(); loaderNotice.style.display='none'; } catch(e){}
+        }
+        if (!gltfLoader) {
+          loaderNotice.style.display='block';
+          loaderNotice.innerText = 'GLTF loader unavailable — open via local server to enable uploading GLB files.';
+          return;
+        }
+        try { await loadGLBFromFile(f); fitGLB(parseFloat(botWEl.value)||1, parseFloat(heightEl.value)||1, parseFloat(faceLEl.value)||1); useGlbEl.checked = true; updateAll(); } catch(e){ alert('GLB load failed — see console.'); console.error(e); }
+      });
+
+      fitBtn.addEventListener('click', ()=>{ fitGLB(parseFloat(botWEl.value)||1, parseFloat(heightEl.value)||1, parseFloat(faceLEl.value)||1); frameScene(); });
+
+      exportGLBBtn.addEventListener('click', ()=>{
+        // lazy init exporter if absent
+        if (!exporter && window.THREE && window.THREE.GLTFExporter) {
+          try { exporter = new THREE.GLTFExporter(); }
+          catch(e){}
+        }
+        exportExtrudeToGLB();
+      });
+
+      downloadCSVBtn.addEventListener('click', async ()=>{ const calc = await updateAll(); downloadCSV(calc); });
+      downloadPDFBtn.addEventListener('click', async ()=>{ const calc = await updateAll(); downloadPDF(calc); });
+
+      updateBtn.addEventListener('click', async ()=>{ await updateAll(); });
+      resetViewBtn.addEventListener('click', ()=>{ controls.reset(); frameScene(); });
+
+      window.addEventListener('resize', ()=>{ const w = container.clientWidth, h = container.clientHeight; camera.aspect = w/h; camera.updateProjectionMatrix(); renderer.setSize(w,h); });
+
+    } catch(err) {
+      window.showError(err);
+    }
+  })();
+  </script>
+</body>
+</html>
