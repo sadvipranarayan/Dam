@@ -7,7 +7,7 @@ import type { DamParameters } from "@shared/schema";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
-import { RotateCcw, Grid3x3, Tag, Download } from "lucide-react";
+import { RotateCcw, Grid3x3, Tag, Download, Droplets } from "lucide-react";
 
 interface DamViewerProps {
   parameters: DamParameters;
@@ -16,6 +16,113 @@ interface DamViewerProps {
 export interface DamViewerRef {
   exportGLB: () => void;
 }
+
+const waterVertexShader = `
+  uniform float time;
+  uniform float flowSpeed;
+  uniform float waveHeight;
+  varying vec2 vUv;
+  varying vec3 vWorldPosition;
+  varying vec3 vNormal;
+  varying float vElevation;
+  
+  void main() {
+    vUv = uv;
+    vNormal = normalize(normalMatrix * normal);
+    
+    vec3 pos = position;
+    
+    float wave1 = sin(pos.x * 0.5 + time * flowSpeed) * waveHeight;
+    float wave2 = sin(pos.z * 0.3 + time * flowSpeed * 0.7) * waveHeight * 0.5;
+    float wave3 = cos(pos.x * 0.2 + pos.z * 0.2 + time * flowSpeed * 1.3) * waveHeight * 0.3;
+    
+    pos.y += wave1 + wave2 + wave3;
+    vElevation = wave1 + wave2 + wave3;
+    
+    vec4 worldPosition = modelMatrix * vec4(pos, 1.0);
+    vWorldPosition = worldPosition.xyz;
+    
+    gl_Position = projectionMatrix * viewMatrix * worldPosition;
+  }
+`;
+
+const waterFragmentShader = `
+  uniform vec3 waterColor;
+  uniform vec3 foamColor;
+  uniform float opacity;
+  uniform float time;
+  uniform float flowSpeed;
+  varying vec2 vUv;
+  varying vec3 vWorldPosition;
+  varying vec3 vNormal;
+  varying float vElevation;
+  
+  void main() {
+    vec3 lightDir = normalize(vec3(1.0, 1.0, 0.5));
+    float diffuse = max(dot(vNormal, lightDir), 0.0);
+    
+    float foam = smoothstep(0.3, 0.8, vElevation * 3.0 + 0.5);
+    foam += sin(vUv.x * 50.0 + time * flowSpeed * 2.0) * 0.1;
+    foam = clamp(foam, 0.0, 1.0);
+    
+    float fresnel = pow(1.0 - max(dot(vNormal, vec3(0.0, 1.0, 0.0)), 0.0), 2.0);
+    
+    vec3 finalColor = mix(waterColor, foamColor, foam * 0.4);
+    finalColor += fresnel * 0.2;
+    finalColor *= (0.6 + diffuse * 0.4);
+    
+    float caustics = sin(vWorldPosition.x * 2.0 + time) * sin(vWorldPosition.z * 2.0 + time * 0.7);
+    finalColor += caustics * 0.03;
+    
+    gl_FragColor = vec4(finalColor, opacity);
+  }
+`;
+
+const flowVertexShader = `
+  uniform float time;
+  uniform float flowSpeed;
+  uniform float turbulence;
+  varying vec2 vUv;
+  varying float vFlow;
+  
+  void main() {
+    vUv = uv;
+    
+    vec3 pos = position;
+    
+    float flowOffset = time * flowSpeed;
+    float wave = sin(pos.y * 5.0 + flowOffset) * turbulence;
+    wave += cos(pos.y * 3.0 + flowOffset * 1.5) * turbulence * 0.5;
+    
+    pos.x += wave;
+    pos.z += wave * 0.5;
+    
+    vFlow = sin(pos.y * 2.0 + flowOffset) * 0.5 + 0.5;
+    
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+  }
+`;
+
+const flowFragmentShader = `
+  uniform vec3 waterColor;
+  uniform vec3 foamColor;
+  uniform float opacity;
+  uniform float time;
+  varying vec2 vUv;
+  varying float vFlow;
+  
+  void main() {
+    float foam = smoothstep(0.6, 1.0, vFlow);
+    foam += sin(vUv.y * 30.0 + time * 5.0) * 0.15;
+    
+    vec3 finalColor = mix(waterColor, foamColor, foam * 0.5);
+    
+    float alpha = opacity * (0.7 + vFlow * 0.3);
+    alpha *= smoothstep(0.0, 0.1, vUv.y) * smoothstep(1.0, 0.9, vUv.y);
+    
+    gl_FragColor = vec4(finalColor, alpha);
+  }
+`;
 
 export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamViewer({ parameters }, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -26,12 +133,252 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
   const damMeshRef = useRef<THREE.Group | null>(null);
   const glbModelRef = useRef<THREE.Group | null>(null);
   const labelGroupRef = useRef<THREE.Group | null>(null);
+  const waterSystemRef = useRef<THREE.Group | null>(null);
+  const particleSystemRef = useRef<THREE.Points | null>(null);
   const animationIdRef = useRef<number | null>(null);
+  const clockRef = useRef<THREE.Clock>(new THREE.Clock());
+  const waterMaterialsRef = useRef<THREE.ShaderMaterial[]>([]);
 
   const [showWireframe, setShowWireframe] = useState(false);
   const [showLabels, setShowLabels] = useState(true);
   const [useGLB, setUseGLB] = useState(true);
   const [glbLoaded, setGlbLoaded] = useState(false);
+  const [showWater, setShowWater] = useState(true);
+
+  const calculateFlowVelocity = useCallback((params: DamParameters) => {
+    const g = 9.81;
+    const head = params.waterDepth;
+    const velocity = Math.sqrt(2 * g * head) * (params.efficiency / 100);
+    return velocity;
+  }, []);
+
+  const calculateDischargeVelocity = useCallback((params: DamParameters) => {
+    const flowArea = params.flowRate / calculateFlowVelocity(params);
+    return Math.min(flowArea, params.bottomWidth * 0.3);
+  }, [calculateFlowVelocity]);
+
+  const createWaterSystem = useCallback((scene: THREE.Scene, params: DamParameters) => {
+    if (waterSystemRef.current) {
+      scene.remove(waterSystemRef.current);
+      waterMaterialsRef.current = [];
+    }
+
+    const waterGroup = new THREE.Group();
+    const velocity = calculateFlowVelocity(params);
+    const flowSpeed = velocity * 0.15;
+    const waveHeight = Math.min(params.flowRate * 0.02, 2);
+
+    const waterColor = new THREE.Color(0x1a5fb4);
+    const foamColor = new THREE.Color(0xffffff);
+
+    const reservoirGeometry = new THREE.PlaneGeometry(
+      params.reservoirLength,
+      params.length,
+      64,
+      64
+    );
+    const reservoirMaterial = new THREE.ShaderMaterial({
+      vertexShader: waterVertexShader,
+      fragmentShader: waterFragmentShader,
+      uniforms: {
+        time: { value: 0 },
+        flowSpeed: { value: flowSpeed * 0.3 },
+        waveHeight: { value: waveHeight * 0.5 },
+        waterColor: { value: waterColor },
+        foamColor: { value: foamColor },
+        opacity: { value: 0.85 },
+      },
+      transparent: true,
+      side: THREE.DoubleSide,
+    });
+    waterMaterialsRef.current.push(reservoirMaterial);
+
+    const reservoir = new THREE.Mesh(reservoirGeometry, reservoirMaterial);
+    reservoir.rotation.x = -Math.PI / 2;
+    reservoir.position.set(
+      -params.bottomWidth / 2 - params.reservoirLength / 2,
+      params.waterDepth * 0.95,
+      0
+    );
+    waterGroup.add(reservoir);
+
+    const spillwayHeight = params.height * 0.7;
+    const spillwayWidth = params.length * 0.6;
+    const flowHeight = params.waterDepth * 0.4;
+    
+    const curvePoints = [];
+    const segments = 30;
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const x = params.bottomWidth / 2 + t * params.bottomWidth * 1.5;
+      const y = spillwayHeight - t * t * spillwayHeight + Math.sin(t * Math.PI) * flowHeight * 0.2;
+      curvePoints.push(new THREE.Vector3(x, Math.max(y, 2), 0));
+    }
+    const flowCurve = new THREE.CatmullRomCurve3(curvePoints);
+
+    const flowTubeGeometry = new THREE.TubeGeometry(
+      flowCurve,
+      64,
+      flowHeight * 0.5 + params.flowRate * 0.05,
+      16,
+      false
+    );
+    const flowMaterial = new THREE.ShaderMaterial({
+      vertexShader: flowVertexShader,
+      fragmentShader: flowFragmentShader,
+      uniforms: {
+        time: { value: 0 },
+        flowSpeed: { value: flowSpeed * 2 },
+        turbulence: { value: params.flowRate * 0.01 },
+        waterColor: { value: waterColor },
+        foamColor: { value: foamColor },
+        opacity: { value: 0.9 },
+      },
+      transparent: true,
+      side: THREE.DoubleSide,
+    });
+    waterMaterialsRef.current.push(flowMaterial);
+
+    const flowTube = new THREE.Mesh(flowTubeGeometry, flowMaterial);
+    waterGroup.add(flowTube);
+
+    const flowSheet = [];
+    for (let z = -spillwayWidth / 2; z <= spillwayWidth / 2; z += spillwayWidth / 8) {
+      const sheetGeometry = new THREE.TubeGeometry(
+        flowCurve,
+        48,
+        flowHeight * 0.3 + params.flowRate * 0.02,
+        8,
+        false
+      );
+      const sheet = new THREE.Mesh(sheetGeometry, flowMaterial.clone());
+      sheet.position.z = z;
+      waterGroup.add(sheet);
+      waterMaterialsRef.current.push(sheet.material as THREE.ShaderMaterial);
+    }
+
+    const tailwaterGeometry = new THREE.PlaneGeometry(
+      params.bottomWidth * 2,
+      params.length,
+      32,
+      32
+    );
+    const tailwaterMaterial = new THREE.ShaderMaterial({
+      vertexShader: waterVertexShader,
+      fragmentShader: waterFragmentShader,
+      uniforms: {
+        time: { value: 0 },
+        flowSpeed: { value: flowSpeed },
+        waveHeight: { value: waveHeight },
+        waterColor: { value: waterColor },
+        foamColor: { value: foamColor },
+        opacity: { value: 0.8 },
+      },
+      transparent: true,
+      side: THREE.DoubleSide,
+    });
+    waterMaterialsRef.current.push(tailwaterMaterial);
+
+    const tailwater = new THREE.Mesh(tailwaterGeometry, tailwaterMaterial);
+    tailwater.rotation.x = -Math.PI / 2;
+    tailwater.position.set(
+      params.bottomWidth / 2 + params.bottomWidth,
+      5,
+      0
+    );
+    waterGroup.add(tailwater);
+
+    scene.add(waterGroup);
+    waterSystemRef.current = waterGroup;
+
+    createParticleSystem(scene, params);
+
+    return waterGroup;
+  }, [calculateFlowVelocity]);
+
+  const createParticleSystem = useCallback((scene: THREE.Scene, params: DamParameters) => {
+    if (particleSystemRef.current) {
+      scene.remove(particleSystemRef.current);
+    }
+
+    const particleCount = Math.floor(params.flowRate * 50);
+    const positions = new Float32Array(particleCount * 3);
+    const velocities = new Float32Array(particleCount * 3);
+    const lifetimes = new Float32Array(particleCount);
+
+    const spillwayX = params.bottomWidth / 2;
+    const spillwayY = params.height * 0.7;
+
+    for (let i = 0; i < particleCount; i++) {
+      positions[i * 3] = spillwayX + Math.random() * params.bottomWidth;
+      positions[i * 3 + 1] = spillwayY - Math.random() * spillwayY;
+      positions[i * 3 + 2] = (Math.random() - 0.5) * params.length * 0.6;
+
+      const velocity = calculateFlowVelocity(params);
+      velocities[i * 3] = velocity * 0.5 + Math.random() * 2;
+      velocities[i * 3 + 1] = -Math.random() * velocity * 0.3;
+      velocities[i * 3 + 2] = (Math.random() - 0.5) * 2;
+
+      lifetimes[i] = Math.random();
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('velocity', new THREE.BufferAttribute(velocities, 3));
+    geometry.setAttribute('lifetime', new THREE.BufferAttribute(lifetimes, 1));
+
+    const material = new THREE.PointsMaterial({
+      color: 0xffffff,
+      size: 0.8,
+      transparent: true,
+      opacity: 0.7,
+      blending: THREE.AdditiveBlending,
+    });
+
+    const particles = new THREE.Points(geometry, material);
+    scene.add(particles);
+    particleSystemRef.current = particles;
+
+    return particles;
+  }, [calculateFlowVelocity]);
+
+  const updateParticles = useCallback((deltaTime: number, params: DamParameters) => {
+    if (!particleSystemRef.current) return;
+
+    const positions = particleSystemRef.current.geometry.attributes.position.array as Float32Array;
+    const velocities = particleSystemRef.current.geometry.attributes.velocity.array as Float32Array;
+    const lifetimes = particleSystemRef.current.geometry.attributes.lifetime.array as Float32Array;
+
+    const gravity = 9.81;
+    const spillwayX = params.bottomWidth / 2;
+    const spillwayY = params.height * 0.7;
+
+    for (let i = 0; i < lifetimes.length; i++) {
+      lifetimes[i] -= deltaTime * 0.5;
+
+      if (lifetimes[i] <= 0 || positions[i * 3 + 1] < 0) {
+        positions[i * 3] = spillwayX + Math.random() * 5;
+        positions[i * 3 + 1] = spillwayY + Math.random() * 5;
+        positions[i * 3 + 2] = (Math.random() - 0.5) * params.length * 0.6;
+        
+        const velocity = calculateFlowVelocity(params);
+        velocities[i * 3] = velocity * 0.5 + Math.random() * 2;
+        velocities[i * 3 + 1] = Math.random() * 3;
+        velocities[i * 3 + 2] = (Math.random() - 0.5) * 2;
+        
+        lifetimes[i] = 1;
+      } else {
+        velocities[i * 3 + 1] -= gravity * deltaTime;
+
+        positions[i * 3] += velocities[i * 3] * deltaTime;
+        positions[i * 3 + 1] += velocities[i * 3 + 1] * deltaTime;
+        positions[i * 3 + 2] += velocities[i * 3 + 2] * deltaTime;
+      }
+    }
+
+    particleSystemRef.current.geometry.attributes.position.needsUpdate = true;
+    particleSystemRef.current.geometry.attributes.lifetime.needsUpdate = true;
+  }, [calculateFlowVelocity]);
 
   const createExtrudedDam = useCallback((scene: THREE.Scene, params: DamParameters) => {
     if (damMeshRef.current) {
@@ -41,7 +388,6 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     const group = new THREE.Group();
     const { topWidth, bottomWidth, height, length } = params;
 
-    // Create trapezoidal cross-section shape
     const shape = new THREE.Shape();
     const halfBottom = bottomWidth / 2;
     const halfTop = topWidth / 2;
@@ -52,7 +398,6 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     shape.lineTo(-halfTop, height);
     shape.closePath();
 
-    // Extrude settings
     const extrudeSettings = {
       depth: length,
       bevelEnabled: false,
@@ -61,7 +406,6 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     const geometry = new THREE.ExtrudeGeometry(shape, extrudeSettings);
     geometry.center();
 
-    // Dam material - concrete-like appearance
     const material = new THREE.MeshStandardMaterial({
       color: 0x8899c8,
       metalness: 0.12,
@@ -73,22 +417,6 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     group.add(mesh);
-
-    // Add water plane
-    const waterWidth = bottomWidth * 2;
-    const waterLength = length * 2;
-    const waterGeometry = new THREE.PlaneGeometry(waterWidth, waterLength);
-    const waterMaterial = new THREE.MeshStandardMaterial({
-      color: 0x3b82f6,
-      transparent: true,
-      opacity: 0.6,
-      metalness: 0.1,
-      roughness: 0.1,
-    });
-    const waterMesh = new THREE.Mesh(waterGeometry, waterMaterial);
-    waterMesh.rotation.x = -Math.PI / 2;
-    waterMesh.position.set(-bottomWidth / 2, params.waterDepth * 0.8, 0);
-    group.add(waterMesh);
 
     scene.add(group);
     damMeshRef.current = group;
@@ -108,27 +436,21 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
 
         const model = gltf.scene;
         
-        // Get the bounding box of the model
         const box = new THREE.Box3().setFromObject(model);
         const size = new THREE.Vector3();
         box.getSize(size);
 
-        // Center the model at origin first
         const center = new THREE.Vector3();
         box.getCenter(center);
         model.position.set(-center.x, -center.y, -center.z);
 
-        // Scale the model to match the parameters
         const scaleX = params.length / (size.x || 1);
         const scaleY = params.height / (size.y || 1);
         const scaleZ = params.bottomWidth / (size.z || 1);
 
         model.scale.set(scaleX, scaleY, scaleZ);
-
-        // Position the model so the base sits on the ground
         model.position.y = 0;
 
-        // Apply wireframe if enabled
         model.traverse((child) => {
           if (child instanceof THREE.Mesh) {
             if (child.material instanceof THREE.Material) {
@@ -159,7 +481,6 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
 
     const group = new THREE.Group();
     
-    // Create dimension lines with sprites
     const createLabel = (text: string, position: THREE.Vector3) => {
       const canvas = document.createElement("canvas");
       const context = canvas.getContext("2d")!;
@@ -185,16 +506,9 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
       return sprite;
     };
 
-    // Height label
     group.add(createLabel(`H: ${params.height}m`, new THREE.Vector3(params.bottomWidth / 2 + 15, params.height / 2, 0)));
-    
-    // Length label
     group.add(createLabel(`L: ${params.length}m`, new THREE.Vector3(0, params.height + 10, 0)));
-    
-    // Bottom width label
     group.add(createLabel(`b: ${params.bottomWidth}m`, new THREE.Vector3(0, -8, 0)));
-    
-    // Top width label
     group.add(createLabel(`a: ${params.topWidth}m`, new THREE.Vector3(0, params.height + 10, params.length / 2 + 20)));
 
     scene.add(group);
@@ -216,7 +530,6 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     const exporter = new GLTFExporter();
     const exportScene = new THREE.Scene();
 
-    // Clone the dam mesh for export
     if (useGLB && glbModelRef.current) {
       exportScene.add(glbModelRef.current.clone());
     } else if (damMeshRef.current) {
@@ -245,16 +558,13 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     exportGLB: handleExportGLB,
   }), [handleExportGLB]);
 
-  // Initialize Three.js scene
   useEffect(() => {
     if (!containerRef.current) return;
 
-    // Scene setup
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0xf3f7ff);
     sceneRef.current = scene;
 
-    // Camera setup
     const camera = new THREE.PerspectiveCamera(
       45,
       containerRef.current.clientWidth / containerRef.current.clientHeight,
@@ -265,7 +575,6 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     camera.position.set(maxDim * 1.5, maxDim, maxDim * 1.5);
     cameraRef.current = camera;
 
-    // Renderer setup
     const renderer = new THREE.WebGLRenderer({ 
       antialias: true, 
       preserveDrawingBuffer: true 
@@ -276,7 +585,6 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     containerRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // Controls
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(0, parameters.height / 2, 0);
     controls.enableDamping = true;
@@ -284,7 +592,6 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     controls.update();
     controlsRef.current = controls;
 
-    // Lighting
     const hemi = new THREE.HemisphereLight(0xffffff, 0x444455, 0.75);
     scene.add(hemi);
 
@@ -296,19 +603,30 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     const ambient = new THREE.AmbientLight(0x404040, 0.5);
     scene.add(ambient);
 
-    // Grid
     const grid = new THREE.GridHelper(500, 50, 0x9aa7b2, 0xe6eefc);
     scene.add(grid);
 
-    // Animation loop
+    clockRef.current = new THREE.Clock();
+
     const animate = () => {
       animationIdRef.current = requestAnimationFrame(animate);
+      
+      const deltaTime = clockRef.current.getDelta();
+      const elapsedTime = clockRef.current.getElapsedTime();
+
+      waterMaterialsRef.current.forEach((material) => {
+        if (material.uniforms.time) {
+          material.uniforms.time.value = elapsedTime;
+        }
+      });
+
+      updateParticles(deltaTime, parameters);
+
       controls.update();
       renderer.render(scene, camera);
     };
     animate();
 
-    // Handle resize
     const handleResize = () => {
       if (!containerRef.current || !camera || !renderer) return;
       camera.aspect = containerRef.current.clientWidth / containerRef.current.clientHeight;
@@ -329,7 +647,6 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     };
   }, []);
 
-  // Update dam model when parameters change
   useEffect(() => {
     if (!sceneRef.current) return;
 
@@ -348,9 +665,22 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     }
 
     createLabels(sceneRef.current, parameters);
-  }, [parameters, useGLB, createExtrudedDam, loadGLBModel, createLabels]);
 
-  // Update wireframe mode
+    if (showWater) {
+      createWaterSystem(sceneRef.current, parameters);
+    } else {
+      if (waterSystemRef.current) {
+        sceneRef.current.remove(waterSystemRef.current);
+        waterSystemRef.current = null;
+      }
+      if (particleSystemRef.current) {
+        sceneRef.current.remove(particleSystemRef.current);
+        particleSystemRef.current = null;
+      }
+      waterMaterialsRef.current = [];
+    }
+  }, [parameters, useGLB, showWater, createExtrudedDam, loadGLBModel, createLabels, createWaterSystem]);
+
   useEffect(() => {
     if (damMeshRef.current) {
       damMeshRef.current.traverse((child) => {
@@ -412,6 +742,19 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
           />
           <Label htmlFor="useGlb" className="flex items-center gap-2 cursor-pointer text-sm">
             Use 3D Model
+          </Label>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <Switch
+            id="showWater"
+            checked={showWater}
+            onCheckedChange={setShowWater}
+            data-testid="switch-show-water"
+          />
+          <Label htmlFor="showWater" className="flex items-center gap-2 cursor-pointer text-sm">
+            <Droplets className="h-4 w-4" />
+            Water Flow
           </Label>
         </div>
         
