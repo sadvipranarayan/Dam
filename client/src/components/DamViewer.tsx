@@ -30,28 +30,25 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
   const animationIdRef = useRef<number | null>(null);
   const clockRef = useRef<THREE.Clock>(new THREE.Clock());
   const waterMixerRef = useRef<THREE.AnimationMixer | null>(null);
-  const waterAnimationsRef = useRef<THREE.AnimationClip[]>([]);
+  const waterMaterialRef = useRef<THREE.ShaderMaterial | null>(null);
+  const parametersRef = useRef<DamParameters>(parameters);
 
   const [showWireframe, setShowWireframe] = useState(false);
   const [showLabels, setShowLabels] = useState(true);
   const [useGLB, setUseGLB] = useState(true);
   const [glbLoaded, setGlbLoaded] = useState(false);
   const [showWater, setShowWater] = useState(true);
-  const [waterLoaded, setWaterLoaded] = useState(false);
+
+  useEffect(() => {
+    parametersRef.current = parameters;
+  }, [parameters]);
 
   const calculateFlowVelocity = useCallback((params: DamParameters) => {
     const g = 9.81;
     const head = params.waterDepth;
     const velocity = Math.sqrt(2 * g * head);
-    return velocity;
+    return velocity * (params.efficiency / 100);
   }, []);
-
-  const calculateAnimationSpeed = useCallback((params: DamParameters) => {
-    const baseVelocity = calculateFlowVelocity(params);
-    const flowFactor = params.flowRate / 100;
-    const efficiencyFactor = params.efficiency / 100;
-    return Math.max(0.1, baseVelocity * flowFactor * efficiencyFactor * 0.1);
-  }, [calculateFlowVelocity]);
 
   const loadWaterModel = useCallback((scene: THREE.Scene, params: DamParameters) => {
     const loader = new GLTFLoader();
@@ -76,37 +73,107 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
         box.getCenter(center);
 
         const scaleX = params.length / (size.x || 1);
-        const scaleY = (params.waterDepth / (size.y || 1)) * 1.2;
+        const scaleY = (params.height * 0.8) / (size.y || 1);
         const scaleZ = params.bottomWidth / (size.z || 1);
         
         waterModel.scale.set(scaleX, scaleY, scaleZ);
-        
         waterModel.position.set(0, 0, 0);
+
+        const flowSpeed = calculateFlowVelocity(params) * 0.1;
+        const waveIntensity = params.flowRate / 100;
+
+        const waterShaderMaterial = new THREE.ShaderMaterial({
+          uniforms: {
+            time: { value: 0 },
+            flowSpeed: { value: flowSpeed },
+            waveIntensity: { value: waveIntensity },
+            waterColor: { value: new THREE.Color(0x1a6fc4) },
+            foamColor: { value: new THREE.Color(0xffffff) },
+            opacity: { value: 0.85 },
+            waterDepth: { value: params.waterDepth },
+          },
+          vertexShader: `
+            uniform float time;
+            uniform float flowSpeed;
+            uniform float waveIntensity;
+            
+            varying vec2 vUv;
+            varying vec3 vWorldPosition;
+            varying vec3 vNormal;
+            varying float vWaveHeight;
+            
+            void main() {
+              vUv = uv;
+              vNormal = normalize(normalMatrix * normal);
+              
+              vec3 pos = position;
+              
+              float wave1 = sin(pos.x * 0.3 + pos.z * 0.2 + time * flowSpeed) * waveIntensity * 2.0;
+              float wave2 = sin(pos.x * 0.5 - time * flowSpeed * 1.5) * waveIntensity * 1.5;
+              float wave3 = cos(pos.z * 0.4 + time * flowSpeed * 0.8) * waveIntensity;
+              float turbulence = sin(pos.x * 2.0 + pos.z * 2.0 + time * flowSpeed * 3.0) * waveIntensity * 0.3;
+              
+              pos.y += wave1 + wave2 + wave3 + turbulence;
+              vWaveHeight = (wave1 + wave2 + wave3 + turbulence) / (waveIntensity * 5.0 + 0.001);
+              
+              vec4 worldPosition = modelMatrix * vec4(pos, 1.0);
+              vWorldPosition = worldPosition.xyz;
+              
+              gl_Position = projectionMatrix * viewMatrix * worldPosition;
+            }
+          `,
+          fragmentShader: `
+            uniform vec3 waterColor;
+            uniform vec3 foamColor;
+            uniform float opacity;
+            uniform float time;
+            uniform float flowSpeed;
+            uniform float waveIntensity;
+            
+            varying vec2 vUv;
+            varying vec3 vWorldPosition;
+            varying vec3 vNormal;
+            varying float vWaveHeight;
+            
+            void main() {
+              vec3 lightDir = normalize(vec3(1.0, 1.0, 0.5));
+              float diffuse = max(dot(vNormal, lightDir), 0.0);
+              
+              float foam = smoothstep(0.4, 0.9, vWaveHeight);
+              foam += sin(vUv.x * 40.0 + time * flowSpeed * 2.0) * 0.1 * waveIntensity;
+              foam = clamp(foam, 0.0, 1.0);
+              
+              float fresnel = pow(1.0 - max(dot(vNormal, vec3(0.0, 1.0, 0.0)), 0.0), 3.0);
+              
+              vec3 deepWater = waterColor * 0.6;
+              vec3 shallowWater = waterColor * 1.2;
+              vec3 baseColor = mix(deepWater, shallowWater, vWaveHeight * 0.5 + 0.5);
+              
+              vec3 finalColor = mix(baseColor, foamColor, foam * 0.5);
+              finalColor += fresnel * 0.3;
+              finalColor *= (0.5 + diffuse * 0.5);
+              
+              float sparkle = pow(max(0.0, sin(vWorldPosition.x * 5.0 + time * 2.0) * sin(vWorldPosition.z * 5.0 + time * 1.5)), 8.0);
+              finalColor += sparkle * 0.2;
+              
+              gl_FragColor = vec4(finalColor, opacity);
+            }
+          `,
+          transparent: true,
+          side: THREE.DoubleSide,
+        });
+
+        waterMaterialRef.current = waterShaderMaterial;
 
         waterModel.traverse((child) => {
           if (child instanceof THREE.Mesh) {
-            if (child.material) {
-              const originalMaterial = child.material as THREE.MeshStandardMaterial;
-              const waterMaterial = new THREE.MeshPhysicalMaterial({
-                color: 0x1a6fc4,
-                metalness: 0.1,
-                roughness: 0.2,
-                transparent: true,
-                opacity: 0.85,
-                transmission: 0.3,
-                thickness: 1.5,
-                ior: 1.33,
-                envMapIntensity: 1.0,
-              });
-              child.material = waterMaterial;
-            }
+            child.material = waterShaderMaterial;
             child.castShadow = true;
             child.receiveShadow = true;
           }
         });
 
         if (gltf.animations && gltf.animations.length > 0) {
-          waterAnimationsRef.current = gltf.animations;
           const mixer = new THREE.AnimationMixer(waterModel);
           waterMixerRef.current = mixer;
 
@@ -115,45 +182,39 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
             action.play();
           });
 
-          const speed = calculateAnimationSpeed(params);
-          mixer.timeScale = speed;
+          mixer.timeScale = flowSpeed;
         }
 
         scene.add(waterModel);
         waterModelRef.current = waterModel;
-        setWaterLoaded(true);
       },
       undefined,
       (error) => {
         console.warn("Could not load water GLB model:", error);
-        setWaterLoaded(false);
       }
     );
-  }, [calculateAnimationSpeed]);
+  }, [calculateFlowVelocity]);
 
   const updateWaterParameters = useCallback((params: DamParameters) => {
+    if (waterMaterialRef.current) {
+      const flowSpeed = calculateFlowVelocity(params) * 0.1;
+      const waveIntensity = params.flowRate / 100;
+      
+      waterMaterialRef.current.uniforms.flowSpeed.value = flowSpeed;
+      waterMaterialRef.current.uniforms.waveIntensity.value = waveIntensity;
+      waterMaterialRef.current.uniforms.waterDepth.value = params.waterDepth;
+    }
+
     if (waterMixerRef.current) {
-      const speed = calculateAnimationSpeed(params);
-      waterMixerRef.current.timeScale = speed;
+      const flowSpeed = calculateFlowVelocity(params) * 0.1;
+      waterMixerRef.current.timeScale = flowSpeed;
     }
 
     if (waterModelRef.current) {
-      const box = new THREE.Box3().setFromObject(waterModelRef.current);
-      const size = new THREE.Vector3();
-      box.getSize(size);
-
       const heightScale = params.waterDepth / 50;
-      waterModelRef.current.scale.y = Math.max(0.5, heightScale);
-
-      waterModelRef.current.traverse((child) => {
-        if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshPhysicalMaterial) {
-          const flowIntensity = params.flowRate / 200;
-          child.material.opacity = 0.7 + flowIntensity * 0.2;
-          child.material.transmission = 0.2 + flowIntensity * 0.2;
-        }
-      });
+      waterModelRef.current.scale.y = Math.max(0.3, heightScale);
     }
-  }, [calculateAnimationSpeed]);
+  }, [calculateFlowVelocity]);
 
   const createExtrudedDam = useCallback((scene: THREE.Scene, params: DamParameters) => {
     if (damMeshRef.current) {
@@ -395,6 +456,11 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
       animationIdRef.current = requestAnimationFrame(animate);
       
       const deltaTime = clockRef.current.getDelta();
+      const elapsedTime = clockRef.current.getElapsedTime();
+
+      if (waterMaterialRef.current) {
+        waterMaterialRef.current.uniforms.time.value = elapsedTime;
+      }
 
       if (waterMixerRef.current) {
         waterMixerRef.current.update(deltaTime);
@@ -461,6 +527,7 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
       if (waterModelRef.current) {
         sceneRef.current.remove(waterModelRef.current);
         waterModelRef.current = null;
+        waterMaterialRef.current = null;
         if (waterMixerRef.current) {
           waterMixerRef.current.stopAllAction();
           waterMixerRef.current = null;
