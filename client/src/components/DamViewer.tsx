@@ -17,17 +17,13 @@ export interface DamViewerRef {
   exportGLB: () => void;
 }
 
-interface WaterSystem {
-  reservoir: THREE.Mesh;
-  spillways: THREE.Group;
+interface ParticleWaterSystem {
+  spillwayParticles: THREE.Points;
+  cascadeParticles: THREE.Points;
   splashParticles: THREE.Points;
-  mist: THREE.Points;
-  materials: {
-    reservoir: THREE.ShaderMaterial;
-    spillway: THREE.ShaderMaterial;
-    splash: THREE.ShaderMaterial;
-    mist: THREE.ShaderMaterial;
-  };
+  mistParticles: THREE.Points;
+  reservoirParticles: THREE.Points;
+  group: THREE.Group;
 }
 
 export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamViewer({ parameters }, ref) {
@@ -38,7 +34,7 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
   const controlsRef = useRef<OrbitControls | null>(null);
   const damMeshRef = useRef<THREE.Group | null>(null);
   const glbModelRef = useRef<THREE.Group | null>(null);
-  const waterSystemRef = useRef<WaterSystem | null>(null);
+  const waterSystemRef = useRef<ParticleWaterSystem | null>(null);
   const labelGroupRef = useRef<THREE.Group | null>(null);
   const animationIdRef = useRef<number | null>(null);
   const clockRef = useRef<THREE.Clock>(new THREE.Clock());
@@ -67,298 +63,263 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     return Cd * Math.sqrt(2 * g * params.waterDepth);
   }, []);
 
-  const createWaterSystem = useCallback((scene: THREE.Scene, params: DamParameters): WaterSystem => {
+  const createParticleWaterSystem = useCallback((scene: THREE.Scene, params: DamParameters): ParticleWaterSystem => {
+    const group = new THREE.Group();
     const g = 9.81;
     const flowVelocity = calculateFlowVelocity(params);
     const dischargeVelocity = calculateDischargeVelocity(params);
     const volumetricFlow = params.flowRate;
-    const numSpillways = Math.max(3, Math.min(12, Math.floor(params.length / 15)));
-    const spillwayWidth = (params.length * 0.7) / numSpillways;
-
-    const reservoirMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        time: { value: 0 },
-        waterColor: { value: new THREE.Color(0x1a5f7a) },
-        deepColor: { value: new THREE.Color(0x0a2f3a) },
-        foamColor: { value: new THREE.Color(0xc8e6f0) },
-        opacity: { value: 0.85 },
-        waveIntensity: { value: volumetricFlow / 200 },
-        flowSpeed: { value: flowVelocity * 0.05 },
-        waterDepth: { value: params.waterDepth },
-      },
-      vertexShader: `
-        uniform float time;
-        uniform float waveIntensity;
-        uniform float flowSpeed;
-        
-        varying vec2 vUv;
-        varying vec3 vWorldPosition;
-        varying vec3 vNormal;
-        varying float vDepth;
-        
-        void main() {
-          vUv = uv;
-          vNormal = normalize(normalMatrix * normal);
-          
-          vec3 pos = position;
-          
-          float wave1 = sin(pos.x * 0.05 + pos.z * 0.03 + time * flowSpeed) * waveIntensity * 0.5;
-          float wave2 = sin(pos.x * 0.08 - time * flowSpeed * 0.7) * waveIntensity * 0.3;
-          float wave3 = cos(pos.z * 0.06 + time * flowSpeed * 0.5) * waveIntensity * 0.2;
-          
-          pos.y += wave1 + wave2 + wave3;
-          vDepth = pos.y;
-          
-          vec4 worldPosition = modelMatrix * vec4(pos, 1.0);
-          vWorldPosition = worldPosition.xyz;
-          
-          gl_Position = projectionMatrix * viewMatrix * worldPosition;
-        }
-      `,
-      fragmentShader: `
-        uniform vec3 waterColor;
-        uniform vec3 deepColor;
-        uniform vec3 foamColor;
-        uniform float opacity;
-        uniform float time;
-        uniform float flowSpeed;
-        uniform float waterDepth;
-        
-        varying vec2 vUv;
-        varying vec3 vWorldPosition;
-        varying vec3 vNormal;
-        varying float vDepth;
-        
-        void main() {
-          vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
-          float diffuse = max(dot(vNormal, lightDir), 0.0);
-          
-          float depthFactor = clamp(vDepth / waterDepth, 0.0, 1.0);
-          vec3 baseColor = mix(deepColor, waterColor, depthFactor);
-          
-          float fresnel = pow(1.0 - max(dot(vNormal, vec3(0.0, 1.0, 0.0)), 0.0), 3.0);
-          
-          float foam = 0.0;
-          foam += smoothstep(0.7, 1.0, sin(vUv.x * 50.0 + time * 2.0) * 0.5 + 0.5) * 0.1;
-          
-          vec3 finalColor = baseColor;
-          finalColor = mix(finalColor, foamColor, foam);
-          finalColor += fresnel * 0.15;
-          finalColor *= (0.6 + diffuse * 0.4);
-          
-          float sparkle = pow(max(0.0, sin(vWorldPosition.x * 3.0 + time * 2.5) * sin(vWorldPosition.z * 3.0 + time * 2.0)), 12.0);
-          finalColor += sparkle * 0.15;
-          
-          gl_FragColor = vec4(finalColor, opacity);
-        }
-      `,
-      transparent: true,
-      side: THREE.DoubleSide,
-    });
-
-    const reservoirLength = params.reservoirLength || params.length * 2;
-    const reservoirGeometry = new THREE.PlaneGeometry(
-      params.length * 1.5,
-      reservoirLength,
-      64,
-      64
-    );
-    reservoirGeometry.rotateX(-Math.PI / 2);
     
-    const reservoir = new THREE.Mesh(reservoirGeometry, reservoirMaterial);
-    reservoir.position.set(0, params.waterDepth * 0.95, -reservoirLength / 2 - params.bottomWidth / 2);
-    scene.add(reservoir);
-
-    const reservoirDepthGeometry = new THREE.BoxGeometry(
-      params.length * 1.5,
-      params.waterDepth,
-      reservoirLength
-    );
-    const reservoirDepthMaterial = new THREE.MeshStandardMaterial({
-      color: 0x0a3040,
-      transparent: true,
-      opacity: 0.6,
-      side: THREE.BackSide,
-    });
-    const reservoirDepth = new THREE.Mesh(reservoirDepthGeometry, reservoirDepthMaterial);
-    reservoirDepth.position.set(0, params.waterDepth / 2, -reservoirLength / 2 - params.bottomWidth / 2);
-    scene.add(reservoirDepth);
+    const numSpillways = Math.max(3, Math.min(12, Math.floor(params.length / 15)));
+    const spillwayWidth = (params.length * 0.6) / numSpillways;
+    const spillwaySpacing = params.length / numSpillways;
+    
+    const particleMultiplier = Math.max(0.5, volumetricFlow / 50);
 
     const spillwayMaterial = new THREE.ShaderMaterial({
       uniforms: {
         time: { value: 0 },
-        waterColor: { value: new THREE.Color(0x4fa8c7) },
+        color: { value: new THREE.Color(0x4fc3f7) },
+        flowSpeed: { value: dischargeVelocity },
+        damHeight: { value: params.height },
+        damWidth: { value: params.bottomWidth },
+      },
+      vertexShader: `
+        uniform float time;
+        uniform float flowSpeed;
+        uniform float damHeight;
+        uniform float damWidth;
+        
+        attribute float particleIndex;
+        attribute float spillwayIndex;
+        attribute float randomOffset;
+        
+        varying float vAlpha;
+        varying float vProgress;
+        
+        void main() {
+          float cycleTime = 3.0;
+          float t = mod(time * flowSpeed * 0.15 + randomOffset, cycleTime) / cycleTime;
+          vProgress = t;
+          
+          vec3 pos = position;
+          
+          float fallTime = t * 2.0;
+          float horizontalVel = flowSpeed * 0.3;
+          
+          pos.y = damHeight - (0.5 * 9.81 * fallTime * fallTime * damHeight * 0.1);
+          pos.z = damWidth * 0.5 + horizontalVel * fallTime * 3.0;
+          
+          pos.x += sin(time * 2.0 + randomOffset * 10.0) * 0.5;
+          pos.z += sin(time * 3.0 + randomOffset * 8.0) * 0.3;
+          
+          if (pos.y < 0.0) {
+            pos.y = 0.0;
+          }
+          
+          vAlpha = 1.0 - t * 0.3;
+          
+          vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+          gl_PointSize = (3.0 + randomOffset * 2.0) * (200.0 / -mvPosition.z);
+          gl_Position = projectionMatrix * mvPosition;
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 color;
+        
+        varying float vAlpha;
+        varying float vProgress;
+        
+        void main() {
+          float dist = length(gl_PointCoord - vec2(0.5));
+          if (dist > 0.5) discard;
+          
+          float alpha = (1.0 - smoothstep(0.3, 0.5, dist)) * vAlpha * 0.9;
+          
+          vec3 finalColor = mix(color, vec3(1.0), vProgress * 0.3);
+          
+          gl_FragColor = vec4(finalColor, alpha);
+        }
+      `,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+    });
+
+    const numSpillwayParticles = Math.floor(3000 * particleMultiplier);
+    const spillwayPositions = new Float32Array(numSpillwayParticles * 3);
+    const spillwayIndices = new Float32Array(numSpillwayParticles);
+    const spillwayRandoms = new Float32Array(numSpillwayParticles);
+    const spillwaySpillwayIdx = new Float32Array(numSpillwayParticles);
+    
+    const startX = -(numSpillways - 1) * spillwaySpacing / 2;
+    
+    for (let i = 0; i < numSpillwayParticles; i++) {
+      const spillwayIdx = Math.floor(Math.random() * numSpillways);
+      const spillwayX = startX + spillwayIdx * spillwaySpacing;
+      
+      spillwayPositions[i * 3] = spillwayX + (Math.random() - 0.5) * spillwayWidth * 0.8;
+      spillwayPositions[i * 3 + 1] = params.height;
+      spillwayPositions[i * 3 + 2] = params.bottomWidth * 0.5;
+      
+      spillwayIndices[i] = i;
+      spillwayRandoms[i] = Math.random();
+      spillwaySpillwayIdx[i] = spillwayIdx;
+    }
+    
+    const spillwayGeometry = new THREE.BufferGeometry();
+    spillwayGeometry.setAttribute('position', new THREE.BufferAttribute(spillwayPositions, 3));
+    spillwayGeometry.setAttribute('particleIndex', new THREE.BufferAttribute(spillwayIndices, 1));
+    spillwayGeometry.setAttribute('randomOffset', new THREE.BufferAttribute(spillwayRandoms, 1));
+    spillwayGeometry.setAttribute('spillwayIndex', new THREE.BufferAttribute(spillwaySpillwayIdx, 1));
+    
+    const spillwayParticles = new THREE.Points(spillwayGeometry, spillwayMaterial);
+    group.add(spillwayParticles);
+
+    const cascadeMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        time: { value: 0 },
+        color: { value: new THREE.Color(0x81d4fa) },
         foamColor: { value: new THREE.Color(0xffffff) },
-        flowSpeed: { value: dischargeVelocity * 0.3 },
-        turbulence: { value: volumetricFlow / 100 },
+        flowSpeed: { value: dischargeVelocity },
+        damHeight: { value: params.height },
+        damWidth: { value: params.bottomWidth },
+      },
+      vertexShader: `
+        uniform float time;
+        uniform float flowSpeed;
+        uniform float damHeight;
+        uniform float damWidth;
+        
+        attribute float randomOffset;
+        attribute float cascadePhase;
+        
+        varying float vAlpha;
+        varying float vFoam;
+        
+        void main() {
+          float cycleTime = 2.5;
+          float t = mod(time * flowSpeed * 0.2 + cascadePhase, cycleTime) / cycleTime;
+          
+          vec3 pos = position;
+          
+          float gravity = 9.81;
+          float fallDist = 0.5 * gravity * t * t * damHeight * 0.15;
+          float horizontalDist = flowSpeed * t * 0.5;
+          
+          pos.y = damHeight * (1.0 - t) - fallDist * 0.5;
+          pos.z = damWidth * 0.5 + horizontalDist + t * t * damHeight * 0.3;
+          
+          pos.x += sin(time * 5.0 + randomOffset * 20.0) * t * 2.0;
+          pos.y += sin(time * 8.0 + randomOffset * 15.0) * t * 0.5;
+          
+          if (pos.y < 0.0) pos.y = 0.0;
+          
+          vAlpha = 0.8 - t * 0.4;
+          vFoam = t;
+          
+          vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+          float size = 2.0 + randomOffset * 3.0 + t * 2.0;
+          gl_PointSize = size * (250.0 / -mvPosition.z);
+          gl_Position = projectionMatrix * mvPosition;
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 color;
+        uniform vec3 foamColor;
+        
+        varying float vAlpha;
+        varying float vFoam;
+        
+        void main() {
+          float dist = length(gl_PointCoord - vec2(0.5));
+          if (dist > 0.5) discard;
+          
+          float alpha = (1.0 - smoothstep(0.2, 0.5, dist)) * vAlpha;
+          
+          vec3 finalColor = mix(color, foamColor, vFoam * 0.6);
+          
+          gl_FragColor = vec4(finalColor, alpha);
+        }
+      `,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+    });
+
+    const numCascadeParticles = Math.floor(5000 * particleMultiplier);
+    const cascadePositions = new Float32Array(numCascadeParticles * 3);
+    const cascadeRandoms = new Float32Array(numCascadeParticles);
+    const cascadePhases = new Float32Array(numCascadeParticles);
+    
+    for (let i = 0; i < numCascadeParticles; i++) {
+      const spillwayIdx = Math.floor(Math.random() * numSpillways);
+      const spillwayX = startX + spillwayIdx * spillwaySpacing;
+      
+      cascadePositions[i * 3] = spillwayX + (Math.random() - 0.5) * spillwayWidth;
+      cascadePositions[i * 3 + 1] = params.height;
+      cascadePositions[i * 3 + 2] = params.bottomWidth * 0.5;
+      
+      cascadeRandoms[i] = Math.random();
+      cascadePhases[i] = Math.random() * 2.5;
+    }
+    
+    const cascadeGeometry = new THREE.BufferGeometry();
+    cascadeGeometry.setAttribute('position', new THREE.BufferAttribute(cascadePositions, 3));
+    cascadeGeometry.setAttribute('randomOffset', new THREE.BufferAttribute(cascadeRandoms, 1));
+    cascadeGeometry.setAttribute('cascadePhase', new THREE.BufferAttribute(cascadePhases, 1));
+    
+    const cascadeParticles = new THREE.Points(cascadeGeometry, cascadeMaterial);
+    group.add(cascadeParticles);
+
+    const splashMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        time: { value: 0 },
+        color: { value: new THREE.Color(0xffffff) },
+        flowSpeed: { value: dischargeVelocity },
         damHeight: { value: params.height },
       },
       vertexShader: `
         uniform float time;
         uniform float flowSpeed;
-        uniform float turbulence;
         uniform float damHeight;
         
-        varying vec2 vUv;
-        varying vec3 vWorldPosition;
-        varying vec3 vNormal;
-        varying float vFlowProgress;
-        varying float vTurbulence;
+        attribute float randomOffset;
+        attribute vec3 velocity;
+        
+        varying float vAlpha;
         
         void main() {
-          vUv = uv;
-          vNormal = normalize(normalMatrix * normal);
+          float cycleTime = 1.5;
+          float t = mod(time * 1.5 + randomOffset * cycleTime, cycleTime) / cycleTime;
           
           vec3 pos = position;
           
-          float flowProgress = 1.0 - (pos.y / damHeight);
-          vFlowProgress = flowProgress;
+          pos += velocity * t * 15.0;
+          pos.y -= 0.5 * 9.81 * t * t * 20.0;
           
-          float speedIncrease = 1.0 + flowProgress * 2.0;
-          float lateralWave = sin(pos.x * 0.5 + time * flowSpeed * speedIncrease) * turbulence * 0.3;
-          float verticalWave = sin(pos.y * 0.3 - time * flowSpeed * speedIncrease * 2.0) * turbulence * 0.2;
-          float cascade = sin(pos.y * 2.0 - time * flowSpeed * 3.0) * turbulence * 0.4 * flowProgress;
+          if (pos.y < 0.0) pos.y = 0.0;
           
-          pos.z += lateralWave + cascade;
-          pos.x += verticalWave * 0.5;
-          
-          vTurbulence = abs(lateralWave) + abs(cascade);
-          
-          vec4 worldPosition = modelMatrix * vec4(pos, 1.0);
-          vWorldPosition = worldPosition.xyz;
-          
-          gl_Position = projectionMatrix * viewMatrix * worldPosition;
-        }
-      `,
-      fragmentShader: `
-        uniform vec3 waterColor;
-        uniform vec3 foamColor;
-        uniform float time;
-        uniform float flowSpeed;
-        uniform float turbulence;
-        
-        varying vec2 vUv;
-        varying vec3 vWorldPosition;
-        varying vec3 vNormal;
-        varying float vFlowProgress;
-        varying float vTurbulence;
-        
-        void main() {
-          vec3 lightDir = normalize(vec3(0.3, 0.8, 0.5));
-          float diffuse = max(dot(vNormal, lightDir), 0.0);
-          
-          float foam = smoothstep(0.2, 0.8, vTurbulence / turbulence);
-          foam += sin(vUv.y * 100.0 - time * flowSpeed * 5.0) * 0.2 * vFlowProgress;
-          foam += pow(vFlowProgress, 2.0) * 0.3;
-          foam = clamp(foam, 0.0, 1.0);
-          
-          float streak = sin(vUv.x * 30.0 + vUv.y * 5.0 - time * flowSpeed * 3.0) * 0.5 + 0.5;
-          streak = pow(streak, 3.0) * 0.3;
-          
-          vec3 cascadeColor = mix(waterColor, vec3(0.7, 0.9, 1.0), vFlowProgress * 0.5);
-          vec3 finalColor = mix(cascadeColor, foamColor, foam * 0.7 + streak);
-          
-          finalColor *= (0.5 + diffuse * 0.5);
-          
-          float opacity = 0.9 - vFlowProgress * 0.2;
-          
-          gl_FragColor = vec4(finalColor, opacity);
-        }
-      `,
-      transparent: true,
-      side: THREE.DoubleSide,
-    });
-
-    const spillways = new THREE.Group();
-    const spillwayStartX = -(numSpillways - 1) * spillwayWidth / 2;
-    
-    for (let i = 0; i < numSpillways; i++) {
-      const spillwayHeight = params.height * 0.95;
-      const curvePoints: THREE.Vector3[] = [];
-      const segments = 30;
-      
-      for (let j = 0; j <= segments; j++) {
-        const t = j / segments;
-        const y = params.height * (1 - t);
-        const parabolicDrop = Math.pow(t, 1.5);
-        const z = params.bottomWidth / 2 + parabolicDrop * params.height * 0.4;
-        curvePoints.push(new THREE.Vector3(0, y, z));
-      }
-      
-      const curve = new THREE.CatmullRomCurve3(curvePoints);
-      const tubeGeometry = new THREE.TubeGeometry(curve, 40, spillwayWidth * 0.4, 12, false);
-      
-      const spillwayMesh = new THREE.Mesh(tubeGeometry, spillwayMaterial.clone());
-      spillwayMesh.position.x = spillwayStartX + i * spillwayWidth * 1.2;
-      spillways.add(spillwayMesh);
-
-      const sheetGeometry = new THREE.PlaneGeometry(spillwayWidth * 0.8, spillwayHeight, 20, 40);
-      const sheetMaterial = spillwayMaterial.clone();
-      (sheetMaterial as THREE.ShaderMaterial).uniforms.turbulence.value = volumetricFlow / 150;
-      
-      const sheetMesh = new THREE.Mesh(sheetGeometry, sheetMaterial);
-      sheetMesh.position.set(
-        spillwayStartX + i * spillwayWidth * 1.2,
-        spillwayHeight / 2,
-        params.bottomWidth / 2 + 2
-      );
-      spillways.add(sheetMesh);
-    }
-    
-    scene.add(spillways);
-
-    const splashMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        time: { value: 0 },
-        particleColor: { value: new THREE.Color(0xffffff) },
-        flowRate: { value: volumetricFlow },
-        velocity: { value: dischargeVelocity },
-      },
-      vertexShader: `
-        uniform float time;
-        uniform float flowRate;
-        uniform float velocity;
-        
-        attribute float size;
-        attribute float life;
-        attribute vec3 velocity3;
-        
-        varying float vLife;
-        varying float vSize;
-        
-        void main() {
-          vLife = life;
-          vSize = size;
-          
-          vec3 pos = position;
-          
-          float phase = fract(time * 0.5 + life);
-          float gravity = 9.81;
-          
-          pos += velocity3 * phase * 2.0;
-          pos.y -= 0.5 * gravity * phase * phase * 4.0;
+          vAlpha = (1.0 - t) * 0.8;
           
           vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
-          gl_PointSize = size * (300.0 / -mvPosition.z) * (1.0 - phase * 0.5);
+          float size = (1.0 + randomOffset * 2.0) * (1.0 - t * 0.5);
+          gl_PointSize = size * (150.0 / -mvPosition.z);
           gl_Position = projectionMatrix * mvPosition;
         }
       `,
       fragmentShader: `
-        uniform vec3 particleColor;
+        uniform vec3 color;
         
-        varying float vLife;
-        varying float vSize;
+        varying float vAlpha;
         
         void main() {
-          vec2 center = gl_PointCoord - vec2(0.5);
-          float dist = length(center);
-          
+          float dist = length(gl_PointCoord - vec2(0.5));
           if (dist > 0.5) discard;
           
-          float alpha = 1.0 - smoothstep(0.2, 0.5, dist);
-          alpha *= 0.7;
+          float alpha = (1.0 - smoothstep(0.0, 0.5, dist)) * vAlpha;
           
-          gl_FragColor = vec4(particleColor, alpha);
+          gl_FragColor = vec4(color, alpha);
         }
       `,
       transparent: true,
@@ -366,79 +327,76 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
       blending: THREE.AdditiveBlending,
     });
 
-    const numParticles = Math.floor(1000 * (volumetricFlow / 100));
-    const splashPositions = new Float32Array(numParticles * 3);
-    const splashSizes = new Float32Array(numParticles);
-    const splashLives = new Float32Array(numParticles);
-    const splashVelocities = new Float32Array(numParticles * 3);
+    const numSplashParticles = Math.floor(2000 * particleMultiplier);
+    const splashPositions = new Float32Array(numSplashParticles * 3);
+    const splashRandoms = new Float32Array(numSplashParticles);
+    const splashVelocities = new Float32Array(numSplashParticles * 3);
     
-    const splashZoneWidth = params.length * 0.8;
-    const splashZoneZ = params.bottomWidth / 2 + params.height * 0.3;
+    const splashZoneZ = params.bottomWidth * 0.5 + params.height * 0.3;
     
-    for (let i = 0; i < numParticles; i++) {
-      splashPositions[i * 3] = (Math.random() - 0.5) * splashZoneWidth;
-      splashPositions[i * 3 + 1] = Math.random() * 5;
-      splashPositions[i * 3 + 2] = splashZoneZ + Math.random() * 10;
+    for (let i = 0; i < numSplashParticles; i++) {
+      const spillwayIdx = Math.floor(Math.random() * numSpillways);
+      const spillwayX = startX + spillwayIdx * spillwaySpacing;
       
-      splashSizes[i] = 0.5 + Math.random() * 1.5;
-      splashLives[i] = Math.random();
+      splashPositions[i * 3] = spillwayX + (Math.random() - 0.5) * spillwayWidth;
+      splashPositions[i * 3 + 1] = 2;
+      splashPositions[i * 3 + 2] = splashZoneZ;
       
-      splashVelocities[i * 3] = (Math.random() - 0.5) * 5;
-      splashVelocities[i * 3 + 1] = 5 + Math.random() * dischargeVelocity * 0.5;
-      splashVelocities[i * 3 + 2] = Math.random() * 3;
+      splashRandoms[i] = Math.random();
+      
+      splashVelocities[i * 3] = (Math.random() - 0.5) * 2;
+      splashVelocities[i * 3 + 1] = 1 + Math.random() * dischargeVelocity * 0.3;
+      splashVelocities[i * 3 + 2] = Math.random() * 1.5;
     }
     
     const splashGeometry = new THREE.BufferGeometry();
     splashGeometry.setAttribute('position', new THREE.BufferAttribute(splashPositions, 3));
-    splashGeometry.setAttribute('size', new THREE.BufferAttribute(splashSizes, 1));
-    splashGeometry.setAttribute('life', new THREE.BufferAttribute(splashLives, 1));
-    splashGeometry.setAttribute('velocity3', new THREE.BufferAttribute(splashVelocities, 3));
+    splashGeometry.setAttribute('randomOffset', new THREE.BufferAttribute(splashRandoms, 1));
+    splashGeometry.setAttribute('velocity', new THREE.BufferAttribute(splashVelocities, 3));
     
     const splashParticles = new THREE.Points(splashGeometry, splashMaterial);
-    scene.add(splashParticles);
+    group.add(splashParticles);
 
     const mistMaterial = new THREE.ShaderMaterial({
       uniforms: {
         time: { value: 0 },
-        mistColor: { value: new THREE.Color(0xffffff) },
-        flowRate: { value: volumetricFlow },
+        color: { value: new THREE.Color(0xffffff) },
       },
       vertexShader: `
         uniform float time;
-        uniform float flowRate;
         
+        attribute float randomOffset;
         attribute float size;
-        attribute float phase;
         
         varying float vAlpha;
         
         void main() {
+          float cycleTime = 4.0;
+          float t = mod(time * 0.3 + randomOffset * cycleTime, cycleTime) / cycleTime;
+          
           vec3 pos = position;
           
-          float t = fract(time * 0.2 + phase);
-          pos.y += t * 20.0;
-          pos.x += sin(time * 0.5 + phase * 10.0) * 3.0;
-          pos.z += cos(time * 0.3 + phase * 8.0) * 2.0;
+          pos.y += t * 25.0;
+          pos.x += sin(time * 0.5 + randomOffset * 10.0) * 5.0;
+          pos.z += cos(time * 0.3 + randomOffset * 8.0) * 3.0;
           
-          vAlpha = (1.0 - t) * 0.3;
+          vAlpha = (1.0 - t) * 0.25;
           
           vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
-          gl_PointSize = size * (400.0 / -mvPosition.z) * (1.0 - t * 0.3);
+          gl_PointSize = size * (1.0 + t) * (400.0 / -mvPosition.z);
           gl_Position = projectionMatrix * mvPosition;
         }
       `,
       fragmentShader: `
-        uniform vec3 mistColor;
+        uniform vec3 color;
         
         varying float vAlpha;
         
         void main() {
-          vec2 center = gl_PointCoord - vec2(0.5);
-          float dist = length(center);
-          
+          float dist = length(gl_PointCoord - vec2(0.5));
           float alpha = (1.0 - smoothstep(0.0, 0.5, dist)) * vAlpha;
           
-          gl_FragColor = vec4(mistColor, alpha);
+          gl_FragColor = vec4(color, alpha);
         }
       `,
       transparent: true,
@@ -446,171 +404,156 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
       blending: THREE.AdditiveBlending,
     });
 
-    const numMistParticles = Math.floor(500 * (volumetricFlow / 100));
+    const numMistParticles = Math.floor(800 * particleMultiplier);
     const mistPositions = new Float32Array(numMistParticles * 3);
+    const mistRandoms = new Float32Array(numMistParticles);
     const mistSizes = new Float32Array(numMistParticles);
-    const mistPhases = new Float32Array(numMistParticles);
     
-    const mistZoneWidth = params.length;
-    const mistZoneZ = params.bottomWidth / 2 + params.height * 0.2;
+    const mistZoneZ = params.bottomWidth * 0.5 + params.height * 0.2;
     
     for (let i = 0; i < numMistParticles; i++) {
-      mistPositions[i * 3] = (Math.random() - 0.5) * mistZoneWidth;
-      mistPositions[i * 3 + 1] = Math.random() * 10;
-      mistPositions[i * 3 + 2] = mistZoneZ + Math.random() * 20;
+      mistPositions[i * 3] = (Math.random() - 0.5) * params.length * 0.8;
+      mistPositions[i * 3 + 1] = Math.random() * 5;
+      mistPositions[i * 3 + 2] = mistZoneZ + Math.random() * 15;
       
+      mistRandoms[i] = Math.random();
       mistSizes[i] = 3 + Math.random() * 5;
-      mistPhases[i] = Math.random();
     }
     
     const mistGeometry = new THREE.BufferGeometry();
     mistGeometry.setAttribute('position', new THREE.BufferAttribute(mistPositions, 3));
+    mistGeometry.setAttribute('randomOffset', new THREE.BufferAttribute(mistRandoms, 1));
     mistGeometry.setAttribute('size', new THREE.BufferAttribute(mistSizes, 1));
-    mistGeometry.setAttribute('phase', new THREE.BufferAttribute(mistPhases, 1));
     
-    const mist = new THREE.Points(mistGeometry, mistMaterial);
-    scene.add(mist);
+    const mistParticles = new THREE.Points(mistGeometry, mistMaterial);
+    group.add(mistParticles);
 
-    const poolLength = params.height * 0.8;
-    const poolGeometry = new THREE.PlaneGeometry(params.length * 1.5, poolLength, 32, 32);
-    poolGeometry.rotateX(-Math.PI / 2);
-    
-    const poolMaterial = new THREE.ShaderMaterial({
+    const reservoirMaterial = new THREE.ShaderMaterial({
       uniforms: {
         time: { value: 0 },
-        waterColor: { value: new THREE.Color(0x2a7a9a) },
-        foamColor: { value: new THREE.Color(0xffffff) },
-        flowSpeed: { value: dischargeVelocity * 0.1 },
-        turbulence: { value: volumetricFlow / 50 },
+        color: { value: new THREE.Color(0x1a5f7a) },
+        flowSpeed: { value: flowVelocity * 0.02 },
       },
       vertexShader: `
         uniform float time;
         uniform float flowSpeed;
-        uniform float turbulence;
         
-        varying vec2 vUv;
-        varying vec3 vNormal;
-        varying float vTurbulence;
+        attribute float randomOffset;
+        
+        varying float vAlpha;
         
         void main() {
-          vUv = uv;
-          vNormal = normalize(normalMatrix * normal);
-          
           vec3 pos = position;
           
-          float distFromCenter = length(pos.xz) * 0.02;
-          float wave = sin(distFromCenter * 10.0 - time * flowSpeed * 2.0) * turbulence * 0.5;
-          wave += sin(pos.x * 0.2 + time * flowSpeed) * turbulence * 0.3;
+          pos.y += sin(time * flowSpeed + pos.x * 0.05 + randomOffset * 10.0) * 0.3;
+          pos.y += sin(time * flowSpeed * 0.7 + pos.z * 0.03) * 0.2;
           
-          pos.y += wave;
-          vTurbulence = abs(wave);
+          vAlpha = 0.6;
           
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+          vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+          gl_PointSize = 4.0 * (200.0 / -mvPosition.z);
+          gl_Position = projectionMatrix * mvPosition;
         }
       `,
       fragmentShader: `
-        uniform vec3 waterColor;
-        uniform vec3 foamColor;
-        uniform float time;
-        uniform float flowSpeed;
-        uniform float turbulence;
+        uniform vec3 color;
         
-        varying vec2 vUv;
-        varying vec3 vNormal;
-        varying float vTurbulence;
+        varying float vAlpha;
         
         void main() {
-          float foam = smoothstep(0.0, turbulence, vTurbulence);
+          float dist = length(gl_PointCoord - vec2(0.5));
+          if (dist > 0.5) discard;
           
-          float ripples = sin((vUv.x + vUv.y) * 50.0 - time * flowSpeed * 3.0) * 0.5 + 0.5;
-          ripples = pow(ripples, 4.0) * (1.0 - vUv.y);
+          float alpha = (1.0 - smoothstep(0.3, 0.5, dist)) * vAlpha;
           
-          vec3 finalColor = mix(waterColor, foamColor, foam * 0.5 + ripples * 0.3);
-          
-          float fresnel = pow(1.0 - max(dot(vNormal, vec3(0.0, 1.0, 0.0)), 0.0), 2.0);
-          finalColor += fresnel * 0.1;
-          
-          gl_FragColor = vec4(finalColor, 0.9);
+          gl_FragColor = vec4(color, alpha);
         }
       `,
       transparent: true,
-      side: THREE.DoubleSide,
+      depthWrite: false,
     });
+
+    const reservoirLength = params.reservoirLength || params.length * 1.5;
+    const reservoirDensity = 0.1;
+    const numReservoirParticles = Math.floor(params.length * reservoirLength * reservoirDensity);
+    const reservoirPositions = new Float32Array(numReservoirParticles * 3);
+    const reservoirRandoms = new Float32Array(numReservoirParticles);
     
-    const pool = new THREE.Mesh(poolGeometry, poolMaterial);
-    pool.position.set(0, 2, params.bottomWidth / 2 + poolLength / 2 + params.height * 0.2);
-    scene.add(pool);
+    for (let i = 0; i < numReservoirParticles; i++) {
+      reservoirPositions[i * 3] = (Math.random() - 0.5) * params.length * 1.3;
+      reservoirPositions[i * 3 + 1] = params.waterDepth * 0.95;
+      reservoirPositions[i * 3 + 2] = -params.bottomWidth * 0.5 - Math.random() * reservoirLength;
+      
+      reservoirRandoms[i] = Math.random();
+    }
+    
+    const reservoirGeometry = new THREE.BufferGeometry();
+    reservoirGeometry.setAttribute('position', new THREE.BufferAttribute(reservoirPositions, 3));
+    reservoirGeometry.setAttribute('randomOffset', new THREE.BufferAttribute(reservoirRandoms, 1));
+    
+    const reservoirParticles = new THREE.Points(reservoirGeometry, reservoirMaterial);
+    group.add(reservoirParticles);
+
+    scene.add(group);
 
     return {
-      reservoir,
-      spillways,
+      spillwayParticles,
+      cascadeParticles,
       splashParticles,
-      mist,
-      materials: {
-        reservoir: reservoirMaterial,
-        spillway: spillwayMaterial,
-        splash: splashMaterial,
-        mist: mistMaterial,
-      },
+      mistParticles,
+      reservoirParticles,
+      group,
     };
   }, [calculateFlowVelocity, calculateDischargeVelocity]);
 
-  const updateWaterSystem = useCallback((waterSystem: WaterSystem, time: number, params: DamParameters) => {
+  const updateParticleWaterSystem = useCallback((waterSystem: ParticleWaterSystem, time: number, params: DamParameters) => {
     const flowVelocity = calculateFlowVelocity(params);
     const dischargeVelocity = calculateDischargeVelocity(params);
-    const volumetricFlow = params.flowRate;
 
-    waterSystem.materials.reservoir.uniforms.time.value = time;
-    waterSystem.materials.reservoir.uniforms.flowSpeed.value = flowVelocity * 0.05;
-    waterSystem.materials.reservoir.uniforms.waveIntensity.value = volumetricFlow / 200;
-    waterSystem.materials.reservoir.uniforms.waterDepth.value = params.waterDepth;
+    const spillwayMat = waterSystem.spillwayParticles.material as THREE.ShaderMaterial;
+    spillwayMat.uniforms.time.value = time;
+    spillwayMat.uniforms.flowSpeed.value = dischargeVelocity;
+    spillwayMat.uniforms.damHeight.value = params.height;
+    spillwayMat.uniforms.damWidth.value = params.bottomWidth;
 
-    waterSystem.spillways.children.forEach((child) => {
-      if (child instanceof THREE.Mesh && child.material instanceof THREE.ShaderMaterial) {
-        child.material.uniforms.time.value = time;
-        child.material.uniforms.flowSpeed.value = dischargeVelocity * 0.3;
-        child.material.uniforms.turbulence.value = volumetricFlow / 100;
-      }
-    });
+    const cascadeMat = waterSystem.cascadeParticles.material as THREE.ShaderMaterial;
+    cascadeMat.uniforms.time.value = time;
+    cascadeMat.uniforms.flowSpeed.value = dischargeVelocity;
+    cascadeMat.uniforms.damHeight.value = params.height;
+    cascadeMat.uniforms.damWidth.value = params.bottomWidth;
 
-    waterSystem.materials.splash.uniforms.time.value = time;
-    waterSystem.materials.splash.uniforms.flowRate.value = volumetricFlow;
-    waterSystem.materials.splash.uniforms.velocity.value = dischargeVelocity;
+    const splashMat = waterSystem.splashParticles.material as THREE.ShaderMaterial;
+    splashMat.uniforms.time.value = time;
+    splashMat.uniforms.flowSpeed.value = dischargeVelocity;
+    splashMat.uniforms.damHeight.value = params.height;
 
-    waterSystem.materials.mist.uniforms.time.value = time;
-    waterSystem.materials.mist.uniforms.flowRate.value = volumetricFlow;
+    const mistMat = waterSystem.mistParticles.material as THREE.ShaderMaterial;
+    mistMat.uniforms.time.value = time;
 
-    waterSystem.reservoir.position.y = params.waterDepth * 0.95;
-    
-    const reservoirScale = params.waterDepth / 50;
-    waterSystem.reservoir.scale.y = Math.max(0.5, reservoirScale);
+    const reservoirMat = waterSystem.reservoirParticles.material as THREE.ShaderMaterial;
+    reservoirMat.uniforms.time.value = time;
+    reservoirMat.uniforms.flowSpeed.value = flowVelocity * 0.02;
+
+    const reservoirPos = waterSystem.reservoirParticles.geometry.attributes.position;
+    const posArray = reservoirPos.array as Float32Array;
+    for (let i = 0; i < posArray.length / 3; i++) {
+      posArray[i * 3 + 1] = params.waterDepth * 0.95;
+    }
+    reservoirPos.needsUpdate = true;
   }, [calculateFlowVelocity, calculateDischargeVelocity]);
 
-  const removeWaterSystem = useCallback((scene: THREE.Scene, waterSystem: WaterSystem) => {
-    scene.remove(waterSystem.reservoir);
-    scene.remove(waterSystem.spillways);
-    scene.remove(waterSystem.splashParticles);
-    scene.remove(waterSystem.mist);
-    
-    scene.children
-      .filter(child => child instanceof THREE.Mesh && child.geometry instanceof THREE.PlaneGeometry)
-      .forEach(child => {
-        if ((child as THREE.Mesh).material instanceof THREE.ShaderMaterial) {
-          const mat = (child as THREE.Mesh).material as THREE.ShaderMaterial;
-          if (mat.uniforms.turbulence) {
-            scene.remove(child);
-          }
-        }
-      });
-
-    scene.children
-      .filter(child => child instanceof THREE.Mesh && child.geometry instanceof THREE.BoxGeometry)
-      .forEach(child => {
-        const mesh = child as THREE.Mesh;
-        if (mesh.material instanceof THREE.MeshStandardMaterial && mesh.material.opacity === 0.6) {
-          scene.remove(child);
-        }
-      });
+  const removeParticleWaterSystem = useCallback((scene: THREE.Scene, waterSystem: ParticleWaterSystem) => {
+    scene.remove(waterSystem.group);
+    waterSystem.spillwayParticles.geometry.dispose();
+    waterSystem.cascadeParticles.geometry.dispose();
+    waterSystem.splashParticles.geometry.dispose();
+    waterSystem.mistParticles.geometry.dispose();
+    waterSystem.reservoirParticles.geometry.dispose();
+    (waterSystem.spillwayParticles.material as THREE.Material).dispose();
+    (waterSystem.cascadeParticles.material as THREE.Material).dispose();
+    (waterSystem.splashParticles.material as THREE.Material).dispose();
+    (waterSystem.mistParticles.material as THREE.Material).dispose();
+    (waterSystem.reservoirParticles.material as THREE.Material).dispose();
   }, []);
 
   const createExtrudedDam = useCallback((scene: THREE.Scene, params: DamParameters) => {
@@ -851,7 +794,7 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
       const elapsedTime = clockRef.current.getElapsedTime();
 
       if (waterSystemRef.current) {
-        updateWaterSystem(waterSystemRef.current, elapsedTime, parametersRef.current);
+        updateParticleWaterSystem(waterSystemRef.current, elapsedTime, parametersRef.current);
       }
 
       controls.update();
@@ -904,16 +847,16 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
 
     if (showWater) {
       if (waterSystemRef.current) {
-        removeWaterSystem(sceneRef.current, waterSystemRef.current);
+        removeParticleWaterSystem(sceneRef.current, waterSystemRef.current);
       }
-      waterSystemRef.current = createWaterSystem(sceneRef.current, parameters);
+      waterSystemRef.current = createParticleWaterSystem(sceneRef.current, parameters);
     } else {
       if (waterSystemRef.current) {
-        removeWaterSystem(sceneRef.current, waterSystemRef.current);
+        removeParticleWaterSystem(sceneRef.current, waterSystemRef.current);
         waterSystemRef.current = null;
       }
     }
-  }, [showWater, parameters, createWaterSystem, removeWaterSystem]);
+  }, [showWater, parameters, createParticleWaterSystem, removeParticleWaterSystem]);
 
   useEffect(() => {
     if (damMeshRef.current) {
