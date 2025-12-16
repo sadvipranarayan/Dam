@@ -70,9 +70,15 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     const dischargeVelocity = calculateDischargeVelocity(params);
     const volumetricFlow = params.flowRate;
     
-    const numSpillways = Math.max(3, Math.min(12, Math.floor(params.length / 15)));
-    const spillwayWidth = (params.length * 0.6) / numSpillways;
-    const spillwaySpacing = params.length / numSpillways;
+    // Force exactly 5 spillways (chutes) and compute even centers along the dam length
+    const numSpillways = 5;
+    const spacing = params.length / (numSpillways + 1);
+    const spillwayCenters: number[] = [];
+    for (let i = 1; i <= numSpillways; i++) {
+      spillwayCenters.push(-params.length / 2 + i * spacing);
+    }
+    const spillwayWidth = params.length * 0.12;
+    const spillwaySpacing = spacing;
     
     const particleMultiplier = Math.max(0.5, volumetricFlow / 50);
 
@@ -152,16 +158,14 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     const spillwayRandoms = new Float32Array(numSpillwayParticles);
     const spillwaySpillwayIdx = new Float32Array(numSpillwayParticles);
     
-    const startX = -(numSpillways - 1) * spillwaySpacing / 2;
-    
     for (let i = 0; i < numSpillwayParticles; i++) {
       const spillwayIdx = Math.floor(Math.random() * numSpillways);
-      const spillwayX = startX + spillwayIdx * spillwaySpacing;
-      
+      const spillwayX = spillwayCenters[spillwayIdx];
++
       spillwayPositions[i * 3] = spillwayX + (Math.random() - 0.5) * spillwayWidth * 0.8;
       spillwayPositions[i * 3 + 1] = params.height;
       spillwayPositions[i * 3 + 2] = params.bottomWidth * 0.5;
-      
++
       spillwayIndices[i] = i;
       spillwayRandoms[i] = Math.random();
       spillwaySpillwayIdx[i] = spillwayIdx;
@@ -251,10 +255,11 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     const cascadePositions = new Float32Array(numCascadeParticles * 3);
     const cascadeRandoms = new Float32Array(numCascadeParticles);
     const cascadePhases = new Float32Array(numCascadeParticles);
+    const cascadeSpillwayIdx = new Float32Array(numCascadeParticles);
     
     for (let i = 0; i < numCascadeParticles; i++) {
       const spillwayIdx = Math.floor(Math.random() * numSpillways);
-      const spillwayX = startX + spillwayIdx * spillwaySpacing;
+      const spillwayX = spillwayCenters[spillwayIdx];
       
       cascadePositions[i * 3] = spillwayX + (Math.random() - 0.5) * spillwayWidth;
       cascadePositions[i * 3 + 1] = params.height;
@@ -262,12 +267,14 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
       
       cascadeRandoms[i] = Math.random();
       cascadePhases[i] = Math.random() * 2.5;
+      cascadeSpillwayIdx[i] = spillwayIdx;
     }
     
     const cascadeGeometry = new THREE.BufferGeometry();
     cascadeGeometry.setAttribute('position', new THREE.BufferAttribute(cascadePositions, 3));
     cascadeGeometry.setAttribute('randomOffset', new THREE.BufferAttribute(cascadeRandoms, 1));
     cascadeGeometry.setAttribute('cascadePhase', new THREE.BufferAttribute(cascadePhases, 1));
+    cascadeGeometry.setAttribute('spillwayIndex', new THREE.BufferAttribute(cascadeSpillwayIdx, 1));
     
     const cascadeParticles = new THREE.Points(cascadeGeometry, cascadeMaterial);
     group.add(cascadeParticles);
@@ -331,28 +338,32 @@ export const DamViewer = forwardRef<DamViewerRef, DamViewerProps>(function DamVi
     const splashPositions = new Float32Array(numSplashParticles * 3);
     const splashRandoms = new Float32Array(numSplashParticles);
     const splashVelocities = new Float32Array(numSplashParticles * 3);
+    const splashSpillwayIdx = new Float32Array(numSplashParticles);
     
     const splashZoneZ = params.bottomWidth * 0.5 + params.height * 0.3;
     
     for (let i = 0; i < numSplashParticles; i++) {
       const spillwayIdx = Math.floor(Math.random() * numSpillways);
-      const spillwayX = startX + spillwayIdx * spillwaySpacing;
+      const spillwayX = spillwayCenters[spillwayIdx];
       
       splashPositions[i * 3] = spillwayX + (Math.random() - 0.5) * spillwayWidth;
       splashPositions[i * 3 + 1] = 2;
       splashPositions[i * 3 + 2] = splashZoneZ;
       
       splashRandoms[i] = Math.random();
+      splashSpillwayIdx[i] = spillwayIdx;
       
-      splashVelocities[i * 3] = (Math.random() - 0.5) * 2;
-      splashVelocities[i * 3 + 1] = 1 + Math.random() * dischargeVelocity * 0.3;
-      splashVelocities[i * 3 + 2] = Math.random() * 1.5;
+      // bias splash velocity outward from dam face (positive z) and a bit sideways
+      splashVelocities[i * 3] = (Math.random() - 0.5) * 1.5; // x
+      splashVelocities[i * 3 + 1] = 1 + Math.random() * dischargeVelocity * 0.4; // y
+      splashVelocities[i * 3 + 2] = 1.0 + Math.random() * dischargeVelocity * 0.8; // stronger outward z
     }
     
     const splashGeometry = new THREE.BufferGeometry();
     splashGeometry.setAttribute('position', new THREE.BufferAttribute(splashPositions, 3));
     splashGeometry.setAttribute('randomOffset', new THREE.BufferAttribute(splashRandoms, 1));
     splashGeometry.setAttribute('velocity', new THREE.BufferAttribute(splashVelocities, 3));
+    splashGeometry.setAttribute('spillwayIndex', new THREE.BufferAttribute(splashSpillwayIdx, 1));
     
     const splashParticles = new THREE.Points(splashGeometry, splashMaterial);
     group.add(splashParticles);
